@@ -7,6 +7,9 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <WiFiManager.h>
+#include <algorithm>
+#include <ESP8266HTTPClient.h>  // for ntfy notifications
+#include <WiFiClientSecureBearSSL.h>
 
 WiFiServer telnetServer(23);
 WiFiClient telnetClient;
@@ -21,14 +24,83 @@ struct Config {
   char deviceName[40];
   int mqttPort;
   bool mqttEnabled;
+  int thresholdLimit;       // ppm
+  int thresholdDuration;    // seconds
+  char topicName[16];       // ntfy topic (6 alphanumeric chars)
 };
 
 Config config;
+
+// Threshold breach tracking
+unsigned long breachStart = 0;
+unsigned long underThresholdStart = 0;
+unsigned long lastNotificationTime = 0;
 
 const int gasSensorPin = A0; // Analog pin connected to MQ9 gas sensor
 
 unsigned long lastReconnectAttempt = 0;
 unsigned long lastReadingTime = 0;
+unsigned long systemStartTime = 0; // Track system start time
+
+#define BUFFER_SIZE 15
+float gasDataBuffer[BUFFER_SIZE] = {0}; // Initialize all elements to 0
+unsigned long lastPublishTime = 0; // Timestamp of the last publish
+const unsigned long publishInterval = 1000; // 15 seconds in milliseconds
+
+// Forward declaration of publishMQTTData
+void publishMQTTData(int gasValue);
+
+void sendNotification(const String &msg) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  // Build ntfy URL
+  String url = String("https://ntfy.sh/") + config.topicName;
+  http.begin(client, url.c_str());  // use C-string overload
+  http.addHeader("Title", "Gas Alert");
+  http.POST(msg);
+  http.end();
+}
+
+// Generate a random 6-char alphanumeric topic
+void generateTopic() {
+  const char *chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  for (int i = 0; i < 6; i++) {
+    config.topicName[i] = chars[random(strlen(chars))];
+  }
+  config.topicName[6] = '\0';
+}
+
+void addGasReading(float gasReading) {
+  //print reading to telnet
+  if (telnetClient && telnetClient.connected()) {
+    telnetClient.printf("Gas Sensor Value: %.2f\n", gasReading);
+    Serial.printf("Gas Sensor Value: %.2f\n", gasReading);
+  }
+
+  // Shift elements to the left
+  for (int i = 1; i < BUFFER_SIZE; i++) {
+    gasDataBuffer[i - 1] = gasDataBuffer[i];
+  }
+  // Add new reading to the end
+  gasDataBuffer[BUFFER_SIZE - 1] = gasReading;
+}
+
+float calculateMedian(float data[], int size) {
+  float temp[size];
+  memcpy(temp, data, size * sizeof(float)); // Copy data to avoid modifying the original array
+  std::sort(temp, temp + size);
+  //print sorted values to telnet
+  if (telnetClient && telnetClient.connected()) {
+    telnetClient.print("Sorted values: ");
+    for (int i = 0; i < size; i++) {
+      telnetClient.printf("[%.2f]", temp[i]);
+    }
+    telnetClient.println();
+  }
+  int mid = size / 2;
+  return (size % 2 == 0) ? (temp[mid - 1] + temp[mid]) / 2.0 : temp[mid];
+}
 
 void saveConfig() {
   File configFile = LittleFS.open("/config.json", "w");
@@ -44,6 +116,9 @@ void saveConfig() {
   json["deviceName"] = config.deviceName;
   json["mqttPort"] = config.mqttPort;
   json["mqttEnabled"] = config.mqttEnabled;
+  json["thresholdLimit"] = config.thresholdLimit;
+  json["thresholdDuration"] = config.thresholdDuration;
+  json["topicName"] = config.topicName;
 
   if (serializeJson(json, configFile) == 0) {
     Serial.println("Failed to write to config file");
@@ -72,31 +147,115 @@ void loadConfig() {
   strlcpy(config.deviceName, json["deviceName"] | "", sizeof(config.deviceName));
   config.mqttPort = json["mqttPort"] | 1883;
   config.mqttEnabled = json["mqttEnabled"] | false;
+  config.thresholdLimit = json["thresholdLimit"] | 200;
+  config.thresholdDuration = json["thresholdDuration"] | 5;
+  strlcpy(config.topicName, json["topicName"] | "", sizeof(config.topicName));
 
   configFile.close();
 }
 
-void reconnectMQTT() {
-  if (!mqttClient.connected()) {
-    unsigned long now = millis();
-    if (now - lastReconnectAttempt > 5000) {
-      lastReconnectAttempt = now;
-      Serial.print("Attempting MQTT connection...");
-      if (mqttClient.connect(config.deviceName, config.mqttUser, config.mqttPassword)) {
-        Serial.println("connected");
-        String configTopic = "homeassistant/sensor/" + String(config.deviceName) + "/config";
-        String configPayload = "{\"name\": \"" + String(config.deviceName) + "\", \"state_topic\": \"" + String(config.deviceName) + "/state\", \"unit_of_measurement\": \"ppm\", \"value_template\": \"{{ value }}\"}";
-        mqttClient.publish(configTopic.c_str(), configPayload.c_str(), true);
+// Handle topic regeneration request
+void handleRegen() {
+  generateTopic();
+  saveConfig();
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
 
-        String gasConfig = "{\"name\":\"" + String(config.deviceName) + " Gas Sensor\",\"device_class\":\"gas\",\"state_topic\":\"homeassistant/sensor/" + String(config.deviceName) + "/gasvalue/state\",\"unit_of_measurement\":\"ppm\",\"unique_id\":\"" + String(config.deviceName) + "_gas\"}";
-        mqttClient.publish(("homeassistant/sensor/" + String(config.deviceName) + "/gasvalue/config").c_str(), gasConfig.c_str(), true);
-      } else {
-        Serial.print("failed, rc=");
-        Serial.print(mqttClient.state());
-        Serial.println(" try again in 5 seconds");
-      }
-    }
+void setupMQTT() {
+ // loadMQTTConfig();
+  
+  if (!config.mqttEnabled) {
+      Serial.println("MQTT disabled");
+      return;
   }
+
+  mqttClient.setServer(config.mqttServer, config.mqttPort);
+  //mqttClient.setCallback(mqttCallback);
+  
+ // printBothf("Attempting to connect to MQTT broker as %s...", deviceConfig.hostname);
+  if (mqttClient.connect(config.mqttServer, config.mqttUser, config.mqttPassword)) {
+     // printBoth("MQTT Connected Successfully");
+      
+    
+      // Publish discovery configs for gas sensor
+     // Define base topic for this device
+     String baseTopic = "homeassistant/sensor/" + String(config.deviceName) + "/gas";
+     String stateTopic = baseTopic + "/state";
+     
+     // Create discovery config
+     String configTopic = baseTopic + "/config";
+     String configPayload = "{\"name\":\"" + String(config.deviceName) + " Gas Sensor\",\"device_class\":\"gas\",\"state_topic\":\"" + stateTopic + "\",\"unit_of_measurement\":\"ppm\",\"unique_id\":\"" + String(config.deviceName) + "_gas\"}";
+   // Add small delay between connection and first publish
+   delay(100);
+        
+   bool pubSuccess = mqttClient.publish(configTopic.c_str(), configPayload.c_str(), true);
+   
+   if (telnetClient && telnetClient.connected()) {
+     telnetClient.printf("MQTT: Discovery config publish %s\n", pubSuccess ? "successful" : "failed");
+   }
+     // mqttClient.subscribe(("homeassistant/" + String(config.deviceName) + "/command").c_str());
+  } else {
+      int state = mqttClient.state();
+      String errorMsg = "Initial MQTT connection failed, state: ";
+      switch (state) {
+          case -4: errorMsg += "MQTT_CONNECTION_TIMEOUT"; break;
+          case -3: errorMsg += "MQTT_CONNECTION_LOST"; break;
+          case -2: errorMsg += "MQTT_CONNECT_FAILED"; break;
+          case -1: errorMsg += "MQTT_DISCONNECTED"; break;
+          case 1: errorMsg += "MQTT_CONNECT_BAD_PROTOCOL"; break;
+          case 2: errorMsg += "MQTT_CONNECT_BAD_CLIENT_ID"; break;
+          case 3: errorMsg += "MQTT_CONNECT_UNAVAILABLE"; break;
+          case 4: errorMsg += "MQTT_CONNECT_BAD_CREDENTIALS"; break;
+          case 5: errorMsg += "MQTT_CONNECT_UNAUTHORIZED"; break;
+          default: errorMsg += String(state);
+      }
+    //  printBoth(errorMsg);
+     // printBoth("Will retry in main loop");
+  }
+}
+void reconnectMQTT() {
+  // Skip if MQTT is not configured or if server name is empty
+  if (!mqttClient.connected() && config.mqttEnabled) {
+    // First check if we have a valid network connection
+    if (WiFi.status() != WL_CONNECTED) {
+      if (telnetClient && telnetClient.connected()) {
+        telnetClient.println("MQTT: WiFi not connected, skipping MQTT connection attempt");
+      }
+      return;
+    }
+
+  // Check if we're already connected
+  if (mqttClient.connected()) {
+    telnetClient.println("MQTT Connected");
+      return;  // Already connected, nothing to do
+  }
+
+  // Try to connect once (non-blocking approach)
+  telnetClient.println("Attempting MQTT connection as ");
+  if (mqttClient.connect(config.mqttServer, config.mqttUser, config.mqttPassword)) {
+      
+    //  mqttClient.subscribe(("homeassistant/" + String(deviceConfig.hostname) + "/command").c_str());
+  } else {
+      int state = mqttClient.state();
+      String errorMsg = "Connection failed, state: ";
+      switch (state) {
+          case -4: errorMsg += "MQTT_CONNECTION_TIMEOUT"; break;
+          case -3: errorMsg += "MQTT_CONNECTION_LOST"; break;
+          case -2: errorMsg += "MQTT_CONNECT_FAILED"; break;
+          case -1: errorMsg += "MQTT_DISCONNECTED"; break;
+          case 1: errorMsg += "MQTT_CONNECT_BAD_PROTOCOL"; break;
+          case 2: errorMsg += "MQTT_CONNECT_BAD_CLIENT_ID"; break;
+          case 3: errorMsg += "MQTT_CONNECT_UNAVAILABLE"; break;
+          case 4: errorMsg += "MQTT_CONNECT_BAD_CREDENTIALS"; break;
+          case 5: errorMsg += "MQTT_CONNECT_UNAUTHORIZED"; break;
+          default: errorMsg += String(state);
+      }
+      //printBoth(errorMsg);
+     // printBoth("Will try again later");
+      // No delay here - the function will return and the main loop will continue
+  }
+}
 }
 
 void handleRoot() {
@@ -141,7 +300,18 @@ void handleRoot() {
   html += "<label for='mqttPort'>MQTT Port:</label>";
   html += "<input type='text' id='mqttPort' name='mqttPort' value='" + String(config.mqttPort) + "'><br>";
   html += "</div>";
-  
+
+  // Threshold configuration
+  html += "<label for='thresholdLimit'>Gas Threshold (ppm):</label>";
+  html += "<input type='number' id='thresholdLimit' name='thresholdLimit' value='" + String(config.thresholdLimit) + "'><br>";
+  html += "<label for='thresholdDuration'>Duration (s):</label>";
+  html += "<input type='number' id='thresholdDuration' name='thresholdDuration' value='" + String(config.thresholdDuration) + "'><br>";
+
+  // Notification topic display with regenerate button
+  html += "<label for='topicName'>Notification Topic:</label>";
+  html += "<input type='text' id='topicName' name='topicName' value='" + String(config.topicName) + "' readonly><br>";
+  html += "<a href='/regen'><button type='button'>Regenerate Topic</button></a><br><br>";
+
   html += "<input type='submit' value='Save'>";
   html += "</form>";
   html += "</body></html>";
@@ -176,6 +346,13 @@ void handleSave() {
     }
   }
 
+  if (server.hasArg("thresholdLimit")) {
+    config.thresholdLimit = server.arg("thresholdLimit").toInt();
+  }
+  if (server.hasArg("thresholdDuration")) {
+    config.thresholdDuration = server.arg("thresholdDuration").toInt();
+  }
+
   // Handle MQTT client disconnect if being disabled
   if (wasMqttEnabled && !config.mqttEnabled) {
     mqttClient.disconnect();
@@ -185,7 +362,7 @@ void handleSave() {
   
   // If MQTT was enabled, initialize it
   if (!wasMqttEnabled && config.mqttEnabled) {
-    mqttClient.setServer(config.mqttServer, config.mqttPort);
+    setupMQTT();
     reconnectMQTT();
   }
   
@@ -200,7 +377,36 @@ void configModeCallback(WiFiManager *myWiFiManager) {
   Serial.println("AP SSID: " + myWiFiManager->getConfigPortalSSID());
 }
 
+void printGasDataBuffer() {
+    
+        for (int i = 0; i < BUFFER_SIZE; i++) {
+          if (telnetClient && telnetClient.connected()) {
+            telnetClient.println("Gas Data Buffer:");
+            telnetClient.printf("[%.2f]", gasDataBuffer[i]);
+          }
+            Serial.printf("[%.2f]", gasDataBuffer[i]);
+        }
+        if (telnetClient && telnetClient.connected()) {
+        telnetClient.printf("\n");
+        }
+        Serial.printf("\n");
+    }
+
+
 void setup() {
+
+  // Initialize LittleFS
+  if (!LittleFS.begin()) {
+    Serial.println("Failed to mount file system");
+    return;
+  }
+  // Load configuration from LittleFS
+  loadConfig();
+  // Generate initial topic if missing
+  if (config.topicName[0] == '\0') {
+    generateTopic();
+    saveConfig();
+  }
   // Initialize serial communication for debugging
   Serial.begin(115200);
 
@@ -231,15 +437,47 @@ void setup() {
   }
   
   Serial.println("Connected to WiFi");
+  // Wait for network to stabilize and show IP
+  delay(2000);
+  Serial.print("Local IP: ");
+  Serial.println(WiFi.localIP());
 
-  // Set up mDNS responder for hostname based on device name
-  if (!MDNS.begin(config.deviceName)) {
-    Serial.println("Error setting up MDNS responder!");
+  // Ensure we are in station mode for mDNS
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  Serial.printf("WiFi mode: %d (1=STA,2=AP,3=STA+AP)\n", WiFi.getMode());
+
+  // Format and sanitize hostname
+  String hostname = String(config.deviceName);
+  hostname.replace(' ', '-');
+  for (size_t i = 0; i < hostname.length(); i++) {
+    if (!isalnum(hostname[i]) && hostname[i] != '-') hostname[i] = '-';
+  }
+  hostname.toLowerCase();
+  if (hostname.length() == 0) hostname = "gas-detector";
+
+  // Set WiFi hostname and start mDNS responder
+  WiFi.hostname(hostname.c_str());  // set DHCP hostname
+  delay(100);
+  Serial.print("DHCP hostname: ");
+  Serial.println(WiFi.hostname());
+  
+  if (!MDNS.begin(hostname.c_str())) {
+    Serial.println("Error setting up mDNS responder");
+    // Debug info
+    Serial.print("Local IP: "); Serial.println(WiFi.localIP());
+    Serial.print("MAC: "); Serial.println(WiFi.macAddress());
   } else {
-    Serial.println("mDNS responder started for " + String(config.deviceName));
+    MDNS.addService("http", "tcp", 80);
+    MDNS.addService("telnet", "tcp", 23);
+    Serial.printf("mDNS responder started: %s.local\n", hostname.c_str());
+    // Debug info
+    Serial.print("mDNS hostname: "); Serial.println(hostname + ".local");
   }
 
-  // Configure OTA
+  // Configure OTA with same hostname
+  ArduinoOTA.setHostname(hostname.c_str());
+
   ArduinoOTA.onStart([]() {
     String type;
     if (ArduinoOTA.getCommand() == U_FLASH) {
@@ -281,39 +519,35 @@ void setup() {
   telnetServer.setNoDelay(true);
   Serial.println("Telnet server started");
 
-  // Initialize LittleFS
-  if (!LittleFS.begin()) {
-    Serial.println("Failed to mount file system");
-    return;
-  }
+  
 
-  // Load configuration from LittleFS
-  loadConfig();
-
-  // Set default device name if not already configured
-  if (strlen(config.deviceName) == 0) {
-    strlcpy(config.deviceName, "GasDetector", sizeof(config.deviceName));
-  }
-
-  // Only setup MQTT if enabled in config
-  if (config.mqttEnabled) {
-    // Set up MQTT client
-    mqttClient.setServer(config.mqttServer, config.mqttPort);
-    // Ensure MQTT connection
-    reconnectMQTT();
-  }
 
   // Start Web Server
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/regen", HTTP_GET, handleRegen);
   server.begin();
   Serial.println("Web server started");
+
+  // Only setup MQTT if enabled in config
+  
+
+  if (WiFi.status() == WL_CONNECTED && config.mqttEnabled)
+  {
+      setupMQTT();
+  }
+  else
+  {
+    Serial.println("WiFi not connected. Skipping MQTT setup.");
+  }
+
+  systemStartTime = millis(); // Record the system start time
 }
 
 void loop() {
   // Handle OTA updates
   ArduinoOTA.handle();
-
+  unsigned long currentTime = millis();
   // Accept new Telnet client using accept() instead of available
   if (telnetServer.hasClient()) {
     if (!telnetClient || !telnetClient.connected()) {
@@ -325,32 +559,117 @@ void loop() {
     }
   }
 
+  // Only perform MQTT operations if enabled
+  if (config.mqttEnabled) {
+    if (!mqttClient.connected()) {
+      reconnectMQTT();
+    }
+    mqttClient.loop(); // Call loop frequently to maintain connection
+  }
+
   unsigned long now = millis();
+
+
   // Read and publish sensor data every second without blocking
   if (now - lastReadingTime >= 1000) {
     lastReadingTime = now;
     
     // Read gas sensor value
-    int gasValue = analogRead(gasSensorPin);
-
-    // Print gas sensor value to Telnet client
+    float gasReading = analogRead(gasSensorPin);
+    //print on telnet
     if (telnetClient && telnetClient.connected()) {
-      telnetClient.printf("Gas Sensor Value: %d\n", gasValue);
+      telnetClient.printf("Gas Sensor Value: %.2f\n", gasReading);
+    }
+    Serial.printf("Gas Sensor Value: %.2f\n", gasReading);
+    // Add gas sensor value to buffer
+    addGasReading(gasReading);
+    printGasDataBuffer();
+
+    // Check threshold breach
+    if (gasReading > config.thresholdLimit && (currentTime - systemStartTime > 60000) ) {
+      // reset under-threshold tracking
+      underThresholdStart = 0;
+      // mark start of breach
+      if (breachStart == 0) {
+        breachStart = now;
+      }
+      // if breach persists long enough, send notification every 10s
+      if (now - breachStart >= (unsigned long)config.thresholdDuration * 1000) {
+        if (lastNotificationTime == 0 || now - lastNotificationTime >= 10000) {
+          sendNotification("Gas leak alert!!");
+          lastNotificationTime = now;
+        }
+      }
+    } else {
+      // reading back under threshold: start under-threshold timer
+      if (underThresholdStart == 0) {
+        underThresholdStart = now;
+      }
+      // if level stays below threshold long enough, reset breach state and notify
+      if (now - underThresholdStart >= (unsigned long)config.thresholdDuration * 1000) {
+        // send alert cleared notification
+        if (breachStart != 0) {
+          sendNotification("Gas level back under threshold");
+        }
+        breachStart = 0;
+        underThresholdStart = 0;
+        lastNotificationTime = 0;
+      }
     }
 
-    // Only perform MQTT operations if enabled
-    if (config.mqttEnabled) {
-      reconnectMQTT();
-      if (mqttClient.connected()) {
-        mqttClient.loop();
-        // Publish gas sensor value to MQTT topic
-        String gasValueStr = String(gasValue);
-        String topic = String(config.deviceName) + "/state";
-        mqttClient.publish(topic.c_str(), gasValueStr.c_str());
-      }
+    // Publish median value every 1 second
+    if (now - lastPublishTime >= publishInterval) {
+        float medianValue = calculateMedian(gasDataBuffer, BUFFER_SIZE);
+        //telnet print median value
+        if (telnetClient && telnetClient.connected()) {
+            telnetClient.printf("Median Gas Sensor Value: %.2f\n", medianValue);
+        }
+        unsigned long currentTime = millis();
+
+        // Skip publishing data for the first 10 seconds after system start
+        if (currentTime - systemStartTime > 60000) {
+          publishMQTTData(medianValue); // Publish median value
+        lastPublishTime = now;
+        }
+        
     }
   }
 
+  // Print the gas data buffer to Telnet
+  
+
   // Handle web server requests
   server.handleClient();
+
+  // Update mDNS once per second
+  static unsigned long _mdnsTimer = 0;
+  if (millis() - _mdnsTimer >= 1000) {
+    MDNS.update();
+    _mdnsTimer = millis();
+  }
+}
+
+void publishMQTTData(int gasValue) {
+  Serial.printf("Publishing gas value: %d\n", gasValue);
+  if (telnetClient && telnetClient.connected()) {
+    telnetClient.printf("Gas Sensor Value: %d\n", gasValue);
+  }
+
+  // Only publish if MQTT is enabled and connected
+  if (config.mqttEnabled ) {
+   
+   
+    mqttClient.loop();
+    // Publish gas sensor value to MQTT topic
+    String gasValueStr = String(gasValue);
+    String topic = "homeassistant/sensor/" + String(config.deviceName) + "/gas/state";
+    
+    // Publish without retain flag for real-time updates
+    bool pubSuccess = mqttClient.publish(topic.c_str(), gasValueStr.c_str(), false);
+    
+    // Log publish result to telnet if connected
+    if (telnetClient && telnetClient.connected()) {
+      telnetClient.printf("MQTT: State publish to %s %s: %s\n", topic.c_str(),gasValueStr.c_str(), pubSuccess ? "successful" : "failed");
+    }
+  }
 }
