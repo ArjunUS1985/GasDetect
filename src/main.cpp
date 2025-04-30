@@ -24,8 +24,8 @@ struct Config {
   char deviceName[40];
   int mqttPort;
   bool mqttEnabled;
-  int thresholdLimit;       // ppm
-  int thresholdDuration;    // seconds
+  int thresholdLimit=200;       // ppm
+  int thresholdDuration=10;    // seconds
   char topicName[16];       // ntfy topic (6 alphanumeric chars)
 };
 
@@ -35,8 +35,41 @@ Config config;
 unsigned long breachStart = 0;
 unsigned long underThresholdStart = 0;
 unsigned long lastNotificationTime = 0;
+unsigned long warmupTime = 60000; // Time to wait before first reading
 
 const int gasSensorPin = A0; // Analog pin connected to MQ9 gas sensor
+const int buzzerPin = D8; // Digital pin connected to buzzer
+
+// LED pin definitions
+const int redPin = D5;
+const int greenPin = D6;
+const int bluePin = D7;
+
+// LED status tracking
+enum LedState {
+  LED_STARTUP,     // Yellow at start
+  LED_WIFI_ONLY,   // Green blinking when WiFi connected
+  LED_MQTT_ACTIVE, // Blue blinking when MQTT connected
+  LED_ALERT        // Red flashing during alerts
+};
+
+LedState currentLedState = LED_STARTUP;
+LedState priorLedState = LED_STARTUP;  // Store state before alert
+bool ledOn = false;
+unsigned long lastLedToggle = 0;
+const unsigned long greenBlinkInterval = 5000;  // 5 seconds total cycle
+const unsigned long blueBlinkInterval = 5000;   // 5 seconds total cycle
+const unsigned long redBlinkInterval = 1000;    // 1 second
+const unsigned long onDuration = 100;           // 500ms ON time for blue/green
+unsigned long ledBlinkInterval = greenBlinkInterval;
+unsigned long currentLedInterval = greenBlinkInterval;
+
+// Variables for non-blocking buzzer operation
+unsigned long buzzerStartTime = 0;
+unsigned long buzzerDuration = 0;
+bool buzzerActive = false;
+bool alertState = false;  // Track if we're in alert state
+unsigned long lastBuzzerToggle = 0;
 
 unsigned long lastReconnectAttempt = 0;
 unsigned long lastReadingTime = 0;
@@ -51,14 +84,24 @@ const unsigned long publishInterval = 1000; // 15 seconds in milliseconds
 void publishMQTTData(int gasValue);
 
 void sendNotification(const String &msg) {
+  // Enable alert state which will trigger beeping in loop
+  alertState = true;
+  
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
   // Build ntfy URL
   String url = String("https://ntfy.sh/") + config.topicName;
+  Serial.printf("Sending notification to ntfy topic: %s\n", url.c_str());
   http.begin(client, url.c_str());  // use C-string overload
   http.addHeader("Title", "Gas Alert");
-  http.POST(msg);
+ 
+  int httpResponseCode = http.POST(msg);
+  if (httpResponseCode > 0) {
+    Serial.printf("Notification sent successfully, HTTP code: %d\n", httpResponseCode);
+  } else {
+    Serial.printf("Failed to send notification, HTTP error: %s\n", http.errorToString(httpResponseCode).c_str());
+  }
   http.end();
 }
 
@@ -392,6 +435,112 @@ void printGasDataBuffer() {
         Serial.printf("\n");
     }
 
+// Function to set RGB LED color
+void setLedColor(bool r, bool g, bool b) {
+  digitalWrite(redPin, r ? HIGH : LOW);
+  digitalWrite(greenPin, g ? HIGH : LOW);
+  digitalWrite(bluePin, b ? HIGH : LOW);
+}
+
+// Function to update LED status
+void updateLedStatus() {
+  unsigned long currentTime = millis();
+  
+  // During alert state
+  if (buzzerActive) {
+    if (currentLedState != LED_ALERT) {
+      priorLedState = currentLedState;
+      currentLedState = LED_ALERT;
+      ledBlinkInterval = redBlinkInterval;
+      currentLedInterval = redBlinkInterval;
+      lastLedToggle = currentTime;
+      ledOn = true;
+      setLedColor(true, false, false); // Red
+    }
+  } else if (currentLedState == LED_ALERT) {
+    // Restore previous state
+    currentLedState = priorLedState;
+    ledOn = true;
+    lastLedToggle = currentTime;
+    if (currentLedState == LED_WIFI_ONLY) {
+      currentLedInterval = greenBlinkInterval;
+      ledBlinkInterval = onDuration;
+    } else if (currentLedState == LED_MQTT_ACTIVE) {
+      currentLedInterval = blueBlinkInterval;
+      ledBlinkInterval = onDuration;
+    }
+  }
+
+  // Update LED state based on connectivity
+  if (!buzzerActive) {
+    if (WiFi.status() == WL_CONNECTED && mqttClient.connected() && config.mqttEnabled) {
+      if (currentLedState != LED_MQTT_ACTIVE) {
+        currentLedState = LED_MQTT_ACTIVE;
+        currentLedInterval = blueBlinkInterval;
+        ledBlinkInterval = onDuration;
+        lastLedToggle = currentTime;
+        ledOn = true;
+        setLedColor(false, false, true); // Blue
+      }
+    } else if (WiFi.status() == WL_CONNECTED) {
+      if (currentLedState != LED_WIFI_ONLY) {
+        currentLedState = LED_WIFI_ONLY;
+        currentLedInterval = greenBlinkInterval;
+        ledBlinkInterval = onDuration;
+        lastLedToggle = currentTime;
+        ledOn = true;
+        setLedColor(false, true, false); // Green
+      }
+    }
+  }
+
+  // Handle blinking based on current state
+  if (currentTime - lastLedToggle >= ledBlinkInterval) {
+    lastLedToggle = currentTime;
+    
+    switch (currentLedState) {
+      case LED_STARTUP:
+        // For startup, just toggle
+        ledOn = !ledOn;
+        setLedColor(ledOn, false, false); // red 
+        break;
+        
+      case LED_WIFI_ONLY:
+        if (ledOn) {
+          // Turn off after 500ms ON time
+          ledOn = false;
+          setLedColor(false, false, false); // OFF
+          ledBlinkInterval = greenBlinkInterval - onDuration; // Remaining time until next cycle
+        } else {
+          // Turn on for 500ms
+          ledOn = true;
+          setLedColor(false, true, false); // Green
+          ledBlinkInterval = onDuration;
+        }
+        break;
+        
+      case LED_MQTT_ACTIVE:
+        if (ledOn) {
+          // Turn off after 500ms ON time
+          ledOn = false;
+          setLedColor(false, false, false); // OFF
+          ledBlinkInterval = blueBlinkInterval - onDuration; // Remaining time until next cycle
+        } else {
+          // Turn on for 500ms
+          ledOn = true;
+          setLedColor(false, false, true); // Blue
+          ledBlinkInterval = onDuration;
+        }
+        break;
+        
+      case LED_ALERT:
+        // For alert state, just toggle every interval
+        ledOn = !ledOn;
+        setLedColor(ledOn, false, false); // Red blink
+        break;
+    }
+  }
+}
 
 void setup() {
 
@@ -408,7 +557,19 @@ void setup() {
     saveConfig();
   }
   // Initialize serial communication for debugging
-  Serial.begin(115200);
+  Serial.begin(9600);
+  
+  // Initialize LED pins
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(bluePin, OUTPUT);
+  
+  // Set initial LED state to red
+  setLedColor(true, false, false);
+  
+  // Initialize buzzer pin
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);  // Ensure buzzer is off initially
 
   // WiFiManager setup
   WiFiManager wifiManager;
@@ -542,12 +703,18 @@ void setup() {
   }
 
   systemStartTime = millis(); // Record the system start time
+  //buzz the buzzer for 500 MS
+  digitalWrite(buzzerPin, HIGH); // Turn on the buzzer
+  delay(100);                   // Wait for 500 milliseconds
+  digitalWrite(buzzerPin, LOW);  // Turn off the buzzer
 }
 
 void loop() {
   // Handle OTA updates
   ArduinoOTA.handle();
   unsigned long currentTime = millis();
+  
+  
   // Accept new Telnet client using accept() instead of available
   if (telnetServer.hasClient()) {
     if (!telnetClient || !telnetClient.connected()) {
@@ -557,6 +724,20 @@ void loop() {
     } else {
       telnetServer.accept().stop(); // Reject new client if already connected
     }
+  }
+
+  // Non-blocking buzzer control for ongoing beeping during alert
+  if (alertState) {
+    // Toggle buzzer every 1 second
+    if (currentTime - lastBuzzerToggle >= 1000) {
+      lastBuzzerToggle = currentTime;
+      buzzerActive = !buzzerActive;
+      digitalWrite(buzzerPin, buzzerActive ? HIGH : LOW);
+    }
+  } else if (buzzerActive) {
+    // Turn off buzzer when not in alert state
+    digitalWrite(buzzerPin, LOW);
+    buzzerActive = false;
   }
 
   // Only perform MQTT operations if enabled
@@ -569,7 +750,10 @@ void loop() {
 
   unsigned long now = millis();
 
-
+if((currentTime - systemStartTime > warmupTime) ){
+  // Update LED status (non-blocking)
+  updateLedStatus();
+  
   // Read and publish sensor data every second without blocking
   if (now - lastReadingTime >= 1000) {
     lastReadingTime = now;
@@ -577,16 +761,16 @@ void loop() {
     // Read gas sensor value
     float gasReading = analogRead(gasSensorPin);
     //print on telnet
-    if (telnetClient && telnetClient.connected()) {
-      telnetClient.printf("Gas Sensor Value: %.2f\n", gasReading);
-    }
+    //if (telnetClient && telnetClient.connected()) {
+    //  telnetClient.printf("Gas Sensor Value: %.2f\n", gasReading);
+    //}
     Serial.printf("Gas Sensor Value: %.2f\n", gasReading);
     // Add gas sensor value to buffer
     addGasReading(gasReading);
     printGasDataBuffer();
 
     // Check threshold breach
-    if (gasReading > config.thresholdLimit && (currentTime - systemStartTime > 60000) ) {
+    if (gasReading > config.thresholdLimit ) {
       // reset under-threshold tracking
       underThresholdStart = 0;
       // mark start of breach
@@ -595,6 +779,7 @@ void loop() {
       }
       // if breach persists long enough, send notification every 10s
       if (now - breachStart >= (unsigned long)config.thresholdDuration * 1000) {
+        alertState = true;  // Enable alert state with beeping
         if (lastNotificationTime == 0 || now - lastNotificationTime >= 10000) {
           sendNotification("Gas leak alert!!");
           lastNotificationTime = now;
@@ -610,6 +795,7 @@ void loop() {
         // send alert cleared notification
         if (breachStart != 0) {
           sendNotification("Gas level back under threshold");
+          alertState = false;  // Disable alert state, stop beeping
         }
         breachStart = 0;
         underThresholdStart = 0;
@@ -621,9 +807,9 @@ void loop() {
     if (now - lastPublishTime >= publishInterval) {
         float medianValue = calculateMedian(gasDataBuffer, BUFFER_SIZE);
         //telnet print median value
-        if (telnetClient && telnetClient.connected()) {
-            telnetClient.printf("Median Gas Sensor Value: %.2f\n", medianValue);
-        }
+       // if (telnetClient && telnetClient.connected()) {
+       //     telnetClient.printf("Median Gas Sensor Value: %.2f\n", medianValue);
+       // }
         unsigned long currentTime = millis();
 
         // Skip publishing data for the first 10 seconds after system start
@@ -637,7 +823,7 @@ void loop() {
 
   // Print the gas data buffer to Telnet
   
-
+}
   // Handle web server requests
   server.handleClient();
 
