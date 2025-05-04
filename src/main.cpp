@@ -24,9 +24,10 @@ struct Config {
   char deviceName[40];
   int mqttPort;
   bool mqttEnabled;
-  int thresholdLimit=200;       // ppm
-  int thresholdDuration=10;    // seconds
+  int thresholdLimit = 200;       // ppm
+  int thresholdDuration = 10;    // seconds
   char topicName[16];       // ntfy topic (6 alphanumeric chars)
+  bool ntfyEnabled;         // Enable/disable ntfy notifications
 };
 
 Config config;
@@ -87,22 +88,33 @@ void sendNotification(const String &msg) {
   // Enable alert state which will trigger beeping in loop
   alertState = true;
   
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  // Build ntfy URL
-  String url = String("https://ntfy.sh/") + config.topicName;
-  Serial.printf("Sending notification to ntfy topic: %s\n", url.c_str());
-  http.begin(client, url.c_str());  // use C-string overload
-  http.addHeader("Title", "Gas Alert");
- 
-  int httpResponseCode = http.POST(msg);
-  if (httpResponseCode > 0) {
-    Serial.printf("Notification sent successfully, HTTP code: %d\n", httpResponseCode);
+  // Only send notification if ntfy is enabled
+  if (config.ntfyEnabled) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    // Build ntfy URL
+    String url = String("https://ntfy.sh/") + config.topicName;
+    Serial.printf("Sending notification to ntfy topic: %s\n", url.c_str());
+    http.begin(client, url.c_str());  // use C-string overload
+    http.addHeader("Title", "Gas Alert");
+   
+    int httpResponseCode = http.POST(msg);
+    if (httpResponseCode > 0) {
+      Serial.printf("Notification sent successfully, HTTP code: %d\n", httpResponseCode);
+    } else {
+      Serial.printf("Failed to send notification, HTTP error: %s\n", http.errorToString(httpResponseCode).c_str());
+    }
+    http.end();
   } else {
-    Serial.printf("Failed to send notification, HTTP error: %s\n", http.errorToString(httpResponseCode).c_str());
+    Serial.println("NTFY notifications disabled, skipping notification");
   }
-  http.end();
+
+  // Start the buzzer non-blockingly
+  buzzerStartTime = millis();
+  buzzerDuration = 1000;
+  buzzerActive = true;
+  digitalWrite(buzzerPin, HIGH);
 }
 
 // Generate a random 6-char alphanumeric topic
@@ -162,6 +174,7 @@ void saveConfig() {
   json["thresholdLimit"] = config.thresholdLimit;
   json["thresholdDuration"] = config.thresholdDuration;
   json["topicName"] = config.topicName;
+  json["ntfyEnabled"] = config.ntfyEnabled;  // Save ntfy status
 
   if (serializeJson(json, configFile) == 0) {
     Serial.println("Failed to write to config file");
@@ -193,6 +206,7 @@ void loadConfig() {
   config.thresholdLimit = json["thresholdLimit"] | 200;
   config.thresholdDuration = json["thresholdDuration"] | 5;
   strlcpy(config.topicName, json["topicName"] | "", sizeof(config.topicName));
+  config.ntfyEnabled = json["ntfyEnabled"] | true;  // Default to enabled for backwards compatibility
 
   configFile.close();
 }
@@ -203,6 +217,29 @@ void handleRegen() {
   saveConfig();
   server.sendHeader("Location", "/", true);
   server.send(302, "text/plain", "");
+}
+
+// Add a handler function for device reset
+void handleReset() {
+  server.send(200, "text/html", "<html><body><h1>Resetting Device</h1><p>The device will now reset and all configurations will be wiped.</p></body></html>");
+  delay(1000); // Give time for the response to be sent
+
+  // Clear stored configurations
+  LittleFS.remove("/config.json");
+  
+  // Clear WiFi settings by removing the wifi config file
+  LittleFS.remove("/wifi_cred.dat");  // WiFiManager stored credentials
+  
+  // Explicitly clear WiFi settings in memory
+  WiFi.disconnect(true);  // disconnect and delete credentials
+  
+  // Wait for WiFi disconnect to complete
+  delay(1000);
+  
+  // Reboot the device - ESP.reset() keeps some settings, use ESP.eraseConfig() for full reset
+  ESP.eraseConfig();
+  delay(1000);
+  ESP.restart();
 }
 
 void setupMQTT() {
@@ -309,14 +346,20 @@ void handleRoot() {
   html += "input[type='submit'] { background: #007BFF; color: white; border: none; padding: 0.7em; border-radius: 3px; cursor: pointer; }";
   html += "input[type='submit']:hover { background: #0056b3; }";
   html += ".mqtt-settings { display: none; }";
+  html += ".danger-button { background: #dc3545; color: white; border: none; padding: 0.7em; border-radius: 3px; cursor: pointer; }";
+  html += ".danger-button:hover { background: #c82333; }";
+  html += ".danger-zone { margin-top: 2em; border-top: 1px solid #ddd; padding-top: 1em; }";
   html += "</style>";
   
-  // Add JavaScript for dynamic show/hide
+  // Add JavaScript for dynamic show/hide and reset confirmation
   html += "<script>";
   html += "function toggleMqttSettings() {";
   html += "  var mqttDiv = document.getElementById('mqttSettings');";
   html += "  var enabled = document.getElementById('mqttEnabled').checked;";
   html += "  mqttDiv.style.display = enabled ? 'block' : 'none';";
+  html += "}";
+  html += "function confirmReset() {";
+  html += "  return confirm('WARNING: This will erase all settings including WiFi credentials and reboot the device. Continue?');";
   html += "}";
   html += "</script></head><body>";
   
@@ -350,6 +393,14 @@ void handleRoot() {
   html += "<label for='thresholdDuration'>Duration (s):</label>";
   html += "<input type='number' id='thresholdDuration' name='thresholdDuration' value='" + String(config.thresholdDuration) + "'><br>";
 
+  // After threshold configuration and before notification topic display, add NTFY toggle
+  html += "<label for='ntfyEnabled'>Enable NTFY Notifications:</label>";
+  html += "<input type='checkbox' id='ntfyEnabled' name='ntfyEnabled' value='1'";
+  if (config.ntfyEnabled) {
+    html += " checked";
+  }
+  html += "><br>";
+
   // Notification topic display with regenerate button
   html += "<label for='topicName'>Notification Topic:</label>";
   html += "<input type='text' id='topicName' name='topicName' value='" + String(config.topicName) + "' readonly><br>";
@@ -357,6 +408,14 @@ void handleRoot() {
 
   html += "<input type='submit' value='Save'>";
   html += "</form>";
+  
+  // Add danger zone with reset device button
+  html += "<div class='danger-zone'>";
+  html += "<h2>Danger Zone</h2>";
+  html += "<p>Resetting the device will erase all configurations including WiFi settings.</p>";
+  html += "<a href='/reset' onclick='return confirmReset()'><button class='danger-button'>Reset Device</button></a>";
+  html += "</div>";
+  
   html += "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -394,6 +453,13 @@ void handleSave() {
   }
   if (server.hasArg("thresholdDuration")) {
     config.thresholdDuration = server.arg("thresholdDuration").toInt();
+  }
+
+  // Handle NTFY toggle
+  if (server.hasArg("ntfyEnabled")) {
+    config.ntfyEnabled = server.arg("ntfyEnabled") == "1";
+  } else {
+    config.ntfyEnabled = false;
   }
 
   // Handle MQTT client disconnect if being disabled
@@ -590,11 +656,15 @@ void setup() {
   // if it does not connect it starts an access point with the specified name
   // and goes into a blocking loop awaiting configuration
   if (!wifiManager.autoConnect(apName.c_str())) {
-    Serial.println("Failed to connect and hit timeout");
-    delay(3000);
-    // Reset and try again
-    ESP.reset();
-    delay(1000);
+    if (wifiManager.startConfigPortal(apName.c_str())) {
+      Serial.println("WiFi configured through portal");
+     
+     
+  } else {
+    Serial.println("Failed to configure WiFi, continuing without WiFi");
+      
+      // We don't restart here - just continue without WiFi
+  }
   }
   
   Serial.println("Connected to WiFi");
@@ -687,6 +757,7 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/regen", HTTP_GET, handleRegen);
+  server.on("/reset", HTTP_GET, handleReset); // Add handler for reset
   server.begin();
   Serial.println("Web server started");
 
@@ -780,7 +851,7 @@ if((currentTime - systemStartTime > warmupTime) ){
       // if breach persists long enough, send notification every 10s
       if (now - breachStart >= (unsigned long)config.thresholdDuration * 1000) {
         alertState = true;  // Enable alert state with beeping
-        if (lastNotificationTime == 0 || now - lastNotificationTime >= 10000) {
+        if (lastNotificationTime == 0 || now - lastNotificationTime >= 30000) {
           sendNotification("Gas leak alert!!");
           lastNotificationTime = now;
         }
