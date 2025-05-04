@@ -51,7 +51,8 @@ enum LedState {
   LED_STARTUP,     // Yellow at start
   LED_WIFI_ONLY,   // Green blinking when WiFi connected
   LED_MQTT_ACTIVE, // Blue blinking when MQTT connected
-  LED_ALERT        // Red flashing during alerts
+  LED_ALERT,       // Red flashing during alerts
+  LED_WIFI_DISCONNECTED  // Red constant when WiFi disconnected
 };
 
 LedState currentLedState = LED_STARTUP;
@@ -71,6 +72,9 @@ unsigned long buzzerDuration = 0;
 bool buzzerActive = false;
 bool alertState = false;  // Track if we're in alert state
 unsigned long lastBuzzerToggle = 0;
+
+// Variables for WiFi disconnection tracking
+unsigned long lastWifiBeepTime = 0;
 
 unsigned long lastReconnectAttempt = 0;
 unsigned long lastReadingTime = 0;
@@ -110,11 +114,7 @@ void sendNotification(const String &msg) {
     Serial.println("NTFY notifications disabled, skipping notification");
   }
 
-  // Start the buzzer non-blockingly
-  buzzerStartTime = millis();
-  buzzerDuration = 1000;
-  buzzerActive = true;
-  digitalWrite(buzzerPin, HIGH);
+
 }
 
 // Generate a random 6-char alphanumeric topic
@@ -539,7 +539,25 @@ void updateLedStatus() {
 
   // Update LED state based on connectivity
   if (!buzzerActive) {
-    if (WiFi.status() == WL_CONNECTED && mqttClient.connected() && config.mqttEnabled) {
+    // Check WiFi connection first
+    if (WiFi.status() != WL_CONNECTED) {
+      // WiFi disconnected - set constant red
+      if (currentLedState != LED_WIFI_DISCONNECTED) {
+        currentLedState = LED_WIFI_DISCONNECTED;
+        ledOn = true;
+        setLedColor(true, false, false); // Solid red
+      }
+      
+      // Beep once every minute during WiFi disconnection
+      if (currentTime - lastWifiBeepTime >= 60000) { // 60 seconds
+        lastWifiBeepTime = currentTime;
+        // Schedule a short beep
+        buzzerStartTime = currentTime;
+        buzzerDuration = 100; // 100ms beep
+        buzzerActive = true;
+        digitalWrite(buzzerPin, HIGH);
+      }
+    } else if (WiFi.status() == WL_CONNECTED && mqttClient.connected() && config.mqttEnabled) {
       if (currentLedState != LED_MQTT_ACTIVE) {
         currentLedState = LED_MQTT_ACTIVE;
         currentLedInterval = blueBlinkInterval;
@@ -569,6 +587,10 @@ void updateLedStatus() {
         // For startup, just toggle
         ledOn = !ledOn;
         setLedColor(ledOn, false, false); // red 
+        break;
+        
+      case LED_WIFI_DISCONNECTED:
+        // Keep constant red, no toggling needed
         break;
         
       case LED_WIFI_ONLY:
@@ -806,9 +828,11 @@ void loop() {
       digitalWrite(buzzerPin, buzzerActive ? HIGH : LOW);
     }
   } else if (buzzerActive) {
-    // Turn off buzzer when not in alert state
-    digitalWrite(buzzerPin, LOW);
-    buzzerActive = false;
+    // Turn off buzzer when duration elapsed
+    if (currentTime - buzzerStartTime >= buzzerDuration) {
+      digitalWrite(buzzerPin, LOW);
+      buzzerActive = false;
+    }
   }
 
   // Only perform MQTT operations if enabled
