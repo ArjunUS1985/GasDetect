@@ -28,6 +28,8 @@ struct Config {
   int thresholdDuration = 10;    // seconds
   char topicName[16];       // ntfy topic (6 alphanumeric chars)
   bool ntfyEnabled;         // Enable/disable ntfy notifications
+  int baseGasValue = -1;    // Base gas value for calibration, -1 means not set
+  int restartCounter = 0;   // Counter for quick restarts
 };
 
 Config config;
@@ -85,8 +87,21 @@ float gasDataBuffer[BUFFER_SIZE] = {0}; // Initialize all elements to 0
 unsigned long lastPublishTime = 0; // Timestamp of the last publish
 const unsigned long publishInterval = 1000; // 15 seconds in milliseconds
 
+// Calibration variables
+bool calibrationRunning = false;
+unsigned long calibrationStartTime = 0;
+unsigned long lastCalibrationLedToggle = 0;
+int calibrationLedState = 0; // 0=R, 1=G, 2=B
+const unsigned long calibrationDuration = 300000; // 5 minutes in milliseconds
+const int numCalibrationReadings = 300; // 300 readings (one per second for 5 minutes)
+float calibrationReadings[300];
+int calibrationReadingCount = 0;
+
 // Forward declaration of publishMQTTData
 void publishMQTTData(int gasValue);
+
+// Add function prototype at the top of the file, before it's used:
+void setLedColor(bool r, bool g, bool b);
 
 void sendNotification(const String &msg) {
   // Enable alert state which will trigger beeping in loop
@@ -113,8 +128,6 @@ void sendNotification(const String &msg) {
   } else {
     Serial.println("NTFY notifications disabled, skipping notification");
   }
-
-
 }
 
 // Generate a random 6-char alphanumeric topic
@@ -175,6 +188,8 @@ void saveConfig() {
   json["thresholdDuration"] = config.thresholdDuration;
   json["topicName"] = config.topicName;
   json["ntfyEnabled"] = config.ntfyEnabled;  // Save ntfy status
+  json["baseGasValue"] = config.baseGasValue;  // Save base gas value
+  json["restartCounter"] = config.restartCounter;  // Save restart counter
 
   if (serializeJson(json, configFile) == 0) {
     Serial.println("Failed to write to config file");
@@ -207,11 +222,51 @@ void loadConfig() {
   config.thresholdDuration = json["thresholdDuration"] | 5;
   strlcpy(config.topicName, json["topicName"] | "", sizeof(config.topicName));
   config.ntfyEnabled = json["ntfyEnabled"] | true;  // Default to enabled for backwards compatibility
+  config.baseGasValue = json["baseGasValue"] | -1; // Default to -1 if not set
+  config.restartCounter = json["restartCounter"] | 0; // Default to 0 if not set
 
   configFile.close();
 }
 
-// Handle topic regeneration request
+// Function to handle calibration LED pattern
+void updateCalibrationLed() {
+  unsigned long currentTime = millis();
+  
+  // Toggle LED every 800ms (300ms on, 500ms off)
+  if (currentTime - lastCalibrationLedToggle >= 800) {
+    lastCalibrationLedToggle = currentTime;
+    
+    // Cycle through Red, Green, Blue
+    if (calibrationLedState == 0) {
+      // Red
+      setLedColor(true, false, false);
+      calibrationLedState = 1;
+    } else if (calibrationLedState == 1) {
+      // Green
+      setLedColor(false, true, false);
+      calibrationLedState = 2;
+    } else {
+      // Blue
+      setLedColor(false, false, true);
+      calibrationLedState = 0;
+    }
+  } else if (currentTime - lastCalibrationLedToggle >= 300) {
+    // Turn LED off after 300ms
+    setLedColor(false, false, false);
+  }
+}
+
+// Calculate average of calibration readings
+float calculateCalibrationAverage() {
+  if (calibrationReadingCount == 0) return -1;
+  
+  float sum = 0;
+  for (int i = 0; i < calibrationReadingCount; i++) {
+    sum += calibrationReadings[i];
+  }
+  return sum / calibrationReadingCount;
+}
+
 void handleRegen() {
   generateTopic();
   saveConfig();
@@ -224,19 +279,43 @@ void handleReset() {
   server.send(200, "text/html", "<html><body><h1>Resetting Device</h1><p>The device will now reset and all configurations will be wiped.</p></body></html>");
   delay(1000); // Give time for the response to be sent
 
-  // Clear stored configurations
-  LittleFS.remove("/config.json");
+  Serial.println("Performing factory reset...");
+
+  // Clear stored configurations - with error checking
+  if (LittleFS.exists("/config.json")) {
+    if (LittleFS.remove("/config.json")) {
+      Serial.println("Config file deleted successfully");
+    } else {
+      Serial.println("Failed to delete config file");
+    }
+  } else {
+    Serial.println("Config file not found");
+  }
   
   // Clear WiFi settings by removing the wifi config file
-  LittleFS.remove("/wifi_cred.dat");  // WiFiManager stored credentials
+  if (LittleFS.exists("/wifi_cred.dat")) {
+    if (LittleFS.remove("/wifi_cred.dat")) {
+      Serial.println("WiFi credentials file deleted successfully");
+    } else {
+      Serial.println("Failed to delete WiFi credentials file");
+    }
+  } else {
+    Serial.println("WiFi credentials file not found");
+  }
+  
+  // Ensure the filesystem has time to complete operations
+  LittleFS.end();
+  delay(500);
   
   // Explicitly clear WiFi settings in memory
   WiFi.disconnect(true);  // disconnect and delete credentials
   
   // Wait for WiFi disconnect to complete
+  Serial.println("Disconnecting WiFi...");
   delay(1000);
   
-  // Reboot the device - ESP.reset() keeps some settings, use ESP.eraseConfig() for full reset
+  // Erase config and reset
+  Serial.println("Erasing configuration and restarting...");
   ESP.eraseConfig();
   delay(1000);
   ESP.restart();
@@ -637,8 +716,54 @@ void setup() {
     Serial.println("Failed to mount file system");
     return;
   }
+
   // Load configuration from LittleFS
   loadConfig();
+
+  // Check if restart counter has reached 3 - if so, calibration reset
+  if (config.restartCounter >= 3) {
+    Serial.println("Restart counter reached 3 - performing calibration reset");
+    
+    
+    // Reset counter to 0
+    config.baseGasValue = -1;
+    saveConfig();
+    
+    // Wait for WiFi disconnect to complete
+    delay(1000);
+  
+  }
+  if (config.restartCounter >= 5) {
+    Serial.println("Restart counter reached 5 - performing factory reset");
+    
+    // Clear stored configurations
+    LittleFS.remove("/config.json");
+    
+    // Clear WiFi settings by removing the wifi config file
+    LittleFS.remove("/wifi_cred.dat");  // WiFiManager stored credentials
+    
+    // Explicitly clear WiFi settings in memory
+    WiFi.disconnect(true);  // disconnect and delete credentials
+    
+    // Reset counter to 0
+    //config.restartCounter = 0;
+    //saveConfig();
+    
+    // Wait for WiFi disconnect to complete
+    delay(1000);
+    
+    // Reboot the device with clean config
+    ESP.eraseConfig();
+    delay(1000);
+    ESP.restart();
+    return;
+  }
+  
+  // Increment restart counter and save
+  config.restartCounter++;
+  Serial.printf("Restart counter: %d\n", config.restartCounter);
+  saveConfig();
+  
   // Generate initial topic if missing
   if (config.topicName[0] == '\0') {
     generateTopic();
@@ -845,80 +970,146 @@ void loop() {
 
   unsigned long now = millis();
 
-if((currentTime - systemStartTime > warmupTime) ){
-  // Update LED status (non-blocking)
-  updateLedStatus();
-  
-  // Read and publish sensor data every second without blocking
-  if (now - lastReadingTime >= 1000) {
-    lastReadingTime = now;
-    
-    // Read gas sensor value
-    float gasReading = analogRead(gasSensorPin);
-    //print on telnet
-    //if (telnetClient && telnetClient.connected()) {
-    //  telnetClient.printf("Gas Sensor Value: %.2f\n", gasReading);
-    //}
-    Serial.printf("Gas Sensor Value: %.2f\n", gasReading);
-    // Add gas sensor value to buffer
-    addGasReading(gasReading);
-    printGasDataBuffer();
-
-    // Check threshold breach
-    if (gasReading > config.thresholdLimit ) {
-      // reset under-threshold tracking
-      underThresholdStart = 0;
-      // mark start of breach
-      if (breachStart == 0) {
-        breachStart = now;
-      }
-      // if breach persists long enough, send notification every 10s
-      if (now - breachStart >= (unsigned long)config.thresholdDuration * 1000) {
-        alertState = true;  // Enable alert state with beeping
-        if (lastNotificationTime == 0 || now - lastNotificationTime >= 30000) {
-          sendNotification("Gas leak alert!!");
-          lastNotificationTime = now;
-        }
-      }
-    } else {
-      // reading back under threshold: start under-threshold timer
-      if (underThresholdStart == 0) {
-        underThresholdStart = now;
-      }
-      // if level stays below threshold long enough, reset breach state and notify
-      if (now - underThresholdStart >= (unsigned long)config.thresholdDuration * 1000) {
-        // send alert cleared notification
-        if (breachStart != 0) {
-          sendNotification("Gas level back under threshold");
-          alertState = false;  // Disable alert state, stop beeping
-        }
-        breachStart = 0;
-        underThresholdStart = 0;
-        lastNotificationTime = 0;
-      }
-    }
-
-    // Publish median value every 1 second
-    if (now - lastPublishTime >= publishInterval) {
-        float medianValue = calculateMedian(gasDataBuffer, BUFFER_SIZE);
-        //telnet print median value
-       // if (telnetClient && telnetClient.connected()) {
-       //     telnetClient.printf("Median Gas Sensor Value: %.2f\n", medianValue);
-       // }
-        unsigned long currentTime = millis();
-
-        // Skip publishing data for the first 10 seconds after system start
-        if (currentTime - systemStartTime > 60000) {
-          publishMQTTData(medianValue); // Publish median value
-        lastPublishTime = now;
-        }
-        
+  // Check if we need to start calibration after warmup
+  if ((currentTime - systemStartTime > warmupTime) && config.baseGasValue == -1 && !calibrationRunning) {
+    // Start calibration process
+    calibrationRunning = true;
+    calibrationStartTime = currentTime;
+    calibrationReadingCount = 0;
+    Serial.println("Starting calibration process for 5 minutes...");
+    if (telnetClient && telnetClient.connected()) {
+      telnetClient.println("Starting calibration process for 5 minutes...");
     }
   }
 
-  // Print the gas data buffer to Telnet
-  
-}
+  // Handle calibration process
+  if (calibrationRunning) {
+    // Update calibration LED pattern
+    updateCalibrationLed();
+    
+    // Take readings every second for 5 minutes
+    if ((currentTime - calibrationStartTime <= calibrationDuration) && 
+        (currentTime - lastReadingTime >= 1000)) {
+      lastReadingTime = currentTime;
+      
+      // Read gas sensor value
+      float rawGasReading = analogRead(gasSensorPin);
+      
+      // Calculate median from buffer
+      float medianValue = calculateMedian(gasDataBuffer, BUFFER_SIZE);
+      
+      // Store median value for calibration if buffer has data
+      if (calibrationReadingCount < numCalibrationReadings && medianValue > 0) {
+        calibrationReadings[calibrationReadingCount++] = medianValue;
+        
+        if (telnetClient && telnetClient.connected()) {
+          telnetClient.printf("Calibration reading %d: %.2f\n", calibrationReadingCount, medianValue);
+        }
+        Serial.printf("Calibration reading %d: %.2f\n", calibrationReadingCount, medianValue);
+      }
+      
+      // Add gas sensor value to buffer
+      addGasReading(rawGasReading);
+      
+    } else if (currentTime - calibrationStartTime > calibrationDuration) {
+      // Calibration complete - calculate average and save
+      config.baseGasValue = (int)calculateCalibrationAverage();
+      saveConfig();
+      calibrationRunning = false;
+      //reset buffer to all zeroes
+      for (int i = 0; i < BUFFER_SIZE; i++) {
+        gasDataBuffer[i] = 0;
+      }
+      Serial.printf("Calibration complete. Base gas value: %d\n", config.baseGasValue);
+      if (telnetClient && telnetClient.connected()) {
+        telnetClient.printf("Calibration complete. Base gas value: %d\n", config.baseGasValue);
+      }
+    }
+  } else if((currentTime - systemStartTime > warmupTime)) {
+    // Normal operation after warmup
+    // Update LED status (non-blocking)
+    updateLedStatus();
+    config.restartCounter = 0;
+    saveConfig();
+    // Read and publish sensor data every second without blocking
+    if (now - lastReadingTime >= 1000) {
+      lastReadingTime = now;
+      
+      // Read gas sensor value
+      float rawGasReading = analogRead(gasSensorPin);
+      
+      // Apply baseline offset if calibrated
+      float gasReading = rawGasReading;
+      if (config.baseGasValue > 0) {
+        gasReading = rawGasReading - config.baseGasValue;
+        if (gasReading < 0) gasReading = 0; // Ensure no negative values
+      }
+      
+      //print on telnet
+      //if (telnetClient && telnetClient.connected()) {
+      //  telnetClient.printf("Gas Sensor Value: %.2f\n", gasReading);
+      //}
+      Serial.printf("Gas Sensor Value: %.2f (raw: %.2f, base: %d)\n", gasReading, rawGasReading, config.baseGasValue);
+      
+      // Add gas sensor value to buffer
+      addGasReading(gasReading);
+      printGasDataBuffer();
+
+      // Check threshold breach
+      if (gasReading > config.thresholdLimit ) {
+        // reset under-threshold tracking
+        underThresholdStart = 0;
+        // mark start of breach
+        if (breachStart == 0) {
+          breachStart = now;
+        }
+        // if breach persists long enough, send notification every 10s
+        if (now - breachStart >= (unsigned long)config.thresholdDuration * 1000) {
+          alertState = true;  // Enable alert state with beeping
+          if (lastNotificationTime == 0 || now - lastNotificationTime >= 30000) {
+            sendNotification("Gas leak alert!!");
+            lastNotificationTime = now;
+          }
+        }
+      } else {
+        // reading back under threshold: start under-threshold timer
+        if (underThresholdStart == 0) {
+          underThresholdStart = now;
+        }
+        // if level stays below threshold long enough, reset breach state and notify
+        if (now - underThresholdStart >= (unsigned long)config.thresholdDuration * 1000) {
+          // send alert cleared notification
+          if (breachStart != 0) {
+            sendNotification("Gas level back under threshold");
+            alertState = false;  // Disable alert state, stop beeping
+          }
+          breachStart = 0;
+          underThresholdStart = 0;
+          lastNotificationTime = 0;
+        }
+      }
+
+      // Publish median value every 1 second
+      if (now - lastPublishTime >= publishInterval) {
+          float medianValue = calculateMedian(gasDataBuffer, BUFFER_SIZE);
+          //telnet print median value
+         // if (telnetClient && telnetClient.connected()) {
+         //     telnetClient.printf("Median Gas Sensor Value: %.2f\n", medianValue);
+         // }
+          unsigned long currentTime = millis();
+
+          // Skip publishing data for the first 10 seconds after system start
+          if (currentTime - systemStartTime > 60000) {
+            publishMQTTData(medianValue); // Publish median value
+          lastPublishTime = now;
+          }
+          
+      }
+    }
+
+    // Print the gas data buffer to Telnet
+    
+  }
   // Handle web server requests
   server.handleClient();
 
