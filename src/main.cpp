@@ -137,15 +137,6 @@ void sendNotification(const String &msg) {
   }
 }
 
-// Generate a random 6-char alphanumeric topic
-void generateTopic() {
-  const char *chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  for (int i = 0; i < 6; i++) {
-    config.topicName[i] = chars[random(strlen(chars))];
-  }
-  config.topicName[6] = '\0';
-}
-
 void addGasReading(float gasReading) {
   //print reading to telnet
   if (telnetClient && telnetClient.connected()) {
@@ -228,10 +219,10 @@ void loadConfig() {
   config.thresholdLimit = json["thresholdLimit"] | 200;
   config.thresholdDuration = json["thresholdDuration"] | 5;
 
-  // Default topicName to last 5 digits of MAC address if not set
+  // Always set topicName to MAC address without colons
   String mac = WiFi.macAddress();
-  String defaultTopic = mac.substring(mac.length() - 5);
-  strlcpy(config.topicName, json["topicName"] | defaultTopic.c_str(), sizeof(config.topicName));
+  mac.replace(":", ""); // Remove colons from MAC address
+  strlcpy(config.topicName, mac.c_str(), sizeof(config.topicName));
 
   config.ntfyEnabled = json["ntfyEnabled"] | true;  // Default to enabled for backwards compatibility
   config.baseGasValue = json["baseGasValue"] | -1; // Default to -1 if not set
@@ -279,12 +270,7 @@ float calculateCalibrationAverage() {
   return sum / calibrationReadingCount;
 }
 
-void handleRegen() {
-  generateTopic();
-  saveConfig();
-  server.sendHeader("Location", "/", true);
-  server.send(302, "text/plain", "");
-}
+
 
 // Add a handler function for device reset
 void handleReset() {
@@ -330,6 +316,32 @@ void handleReset() {
   Serial.println("Erasing configuration and restarting...");
   ESP.eraseConfig();
   delay(1000);
+  ESP.restart();
+}
+
+void handleResetWiFi() {
+  server.send(200, "text/html", "<html><body><h1>Resetting WiFi Settings</h1><p>The device will now reset WiFi settings and reboot.</p></body></html>");
+  delay(1000); // Give time for the response to be sent
+  WiFi.disconnect(true); // Disconnect from Wi-Fi
+  ESP.eraseConfig(); // Erase all Wi-Fi and network-related settings
+  Serial.println("Resetting WiFi settings...");
+
+  // Clear WiFi settings by removing the WiFi credentials file
+  if (LittleFS.exists("/wifi_cred.dat")) {
+    if (LittleFS.remove("/wifi_cred.dat")) {
+      Serial.println("WiFi credentials file deleted successfully");
+    } else {
+      Serial.println("Failed to delete WiFi credentials file");
+    }
+  } else {
+    Serial.println("WiFi credentials file not found");
+  }
+
+ 
+  // Wait for WiFi disconnect to complete
+  delay(1000);
+
+  // Restart the device
   ESP.restart();
 }
 
@@ -451,18 +463,20 @@ void reconnectMQTT() {
 
 void handleRoot() {
   String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<style>body { font-family: Arial, sans-serif; margin: 0; padding: 0; }";
-  html += "form { max-width: 400px; margin: auto; padding: 1em; background: #f9f9f9; border-radius: 5px; }";
-  html += "input[type='text'], input[type='password'] { width: 100%; padding: 0.5em; margin: 0.5em 0; border: 1px solid #ccc; border-radius: 3px; }";
-  html += "input[type='submit'] { background: #007BFF; color: white; border: none; padding: 0.7em; border-radius: 3px; cursor: pointer; }";
-  html += "input[type='submit']:hover { background: #0056b3; }";
-  html += ".mqtt-settings { display: none; }";
-  html += ".danger-button { background: #dc3545; color: white; border: none; padding: 0.7em; border-radius: 3px; cursor: pointer; }";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f4f4f9; color: #333; }";
+  html += "h1, h2 { text-align: center; color: #444; }";
+  html += "form, .info-section, .danger-zone { max-width: 90%; margin: 1em auto; padding: 1em; background: #fff; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }";
+  html += "input[type='text'], input[type='password'], input[type='number'] { width: 100%; padding: 0.7em; margin: 0.5em 0; border: 1px solid #ccc; border-radius: 3px; box-sizing: border-box; }";
+  html += "input[type='submit'], button { width: 100%; background: #007BFF; color: white; border: none; padding: 0.7em; border-radius: 3px; cursor: pointer; font-size: 1em; }";
+  html += "input[type='submit']:hover, button:hover { background: #0056b3; }";
+  html += ".danger-button { background: #dc3545; }";
   html += ".danger-button:hover { background: #c82333; }";
-  html += ".danger-zone { margin-top: 2em; border-top: 1px solid #ddd; padding-top: 1em; }";
+  html += ".info-section p, .danger-zone p { margin: 0.5em 0; }";
+  html += ".info-section strong, .danger-zone strong { display: inline-block; width: 50%; }";
+  html += ".mqtt-settings { display: none; }";
   html += "</style>";
 
-  // Add JavaScript for dynamic show/hide and reset confirmation
   html += "<script>";
   html += "function toggleMqttSettings() {";
   html += "  var mqttDiv = document.getElementById('mqttSettings');";
@@ -474,7 +488,7 @@ void handleRoot() {
   html += "}";
   html += "</script></head><body>";
 
-  html += "<h1 style='text-align: center;'>Device Configuration</h1>";
+  html += "<h1>Device Configuration</h1>";
   html += "<form action='/save' method='POST'>";
   html += "<label for='deviceName'>Device Name:</label>";
   html += "<input type='text' id='deviceName' name='deviceName' value='" + String(config.deviceName) + "'><br>";
@@ -486,7 +500,6 @@ void handleRoot() {
   }
   html += "><br>";
 
-  // MQTT settings in a div that can be shown/hidden
   html += "<div id='mqttSettings' class='mqtt-settings' style='display: " + String(config.mqttEnabled ? "block" : "none") + ";'>";
   html += "<label for='mqttServer'>MQTT Server:</label>";
   html += "<input type='text' id='mqttServer' name='mqttServer' value='" + String(config.mqttServer) + "'><br>";
@@ -495,16 +508,14 @@ void handleRoot() {
   html += "<label for='mqttPassword'>MQTT Password:</label>";
   html += "<input type='password' id='mqttPassword' name='mqttPassword' value='" + String(config.mqttPassword) + "'><br>";
   html += "<label for='mqttPort'>MQTT Port:</label>";
-  html += "<input type='text' id='mqttPort' name='mqttPort' value='" + String(config.mqttPort) + "'><br>";
+  html += "<input type='number' id='mqttPort' name='mqttPort' value='" + String(config.mqttPort) + "'><br>";
   html += "</div>";
 
-  // Threshold configuration
   html += "<label for='thresholdLimit'>Gas Threshold (ppm):</label>";
   html += "<input type='number' id='thresholdLimit' name='thresholdLimit' value='" + String(config.thresholdLimit) + "'><br>";
   html += "<label for='thresholdDuration'>Duration (s):</label>";
   html += "<input type='number' id='thresholdDuration' name='thresholdDuration' value='" + String(config.thresholdDuration) + "'><br>";
 
-  // After threshold configuration and before notification topic display, add NTFY toggle
   html += "<label for='ntfyEnabled'>Enable NTFY Notifications:</label>";
   html += "<input type='checkbox' id='ntfyEnabled' name='ntfyEnabled' value='1'";
   if (config.ntfyEnabled) {
@@ -512,41 +523,47 @@ void handleRoot() {
   }
   html += "><br>";
 
-  // Notification topic display with regenerate button
   html += "<label for='topicName'>Notification Topic:</label>";
   html += "<input type='text' id='topicName' name='topicName' value='" + String(config.topicName) + "' readonly><br>";
-  html += "<a href='/regen'><button type='button'>Regenerate Topic</button></a><br><br>";
 
   html += "<input type='submit' value='Save'>";
   html += "</form>";
 
-  // Add section to display raw value, adjustment value, and adjusted value
   html += "<div class='info-section'>";
-  html += "<h2>Sensor Values</h2>";
-  html += "<p><strong>Raw Value:</strong> " + String(analogRead(gasSensorPin)) + "</p>";
-  html += "<p><strong>Adjustment Value:</strong> " + String(config.baseGasValue) + "</p>";
-  html += "<p><strong>Adjusted Value:</strong> " + String(analogRead(gasSensorPin) - config.baseGasValue) + "</p>";
+  html += "<h2>Device Information</h2>";
+  html += "<p><strong>IP Address:</strong><span>" + WiFi.localIP().toString() + "</span></p>";
+  html += "<p><strong>MAC Address:</strong><span>" + WiFi.macAddress() + "</span></p>";
   html += "</div>";
 
-  // Add danger zone with reset device button
+  html += "<div class='info-section'>";
+  html += "<h2>Sensor Values</h2>";
+  html += "<p><strong>Raw Value:</strong><span>" + String(analogRead(gasSensorPin)) + "</span></p>";
+  html += "<p><strong>Adjustment Value:</strong><span>" + String(config.baseGasValue) + "</span></p>";
+  html += "<p><strong>Adjusted Value:</strong><span>" + String(analogRead(gasSensorPin) - config.baseGasValue) + "</span></p>";
+  html += "</div>";
+
   html += "<div class='danger-zone'>";
   html += "<h2>Danger Zone</h2>";
-  html += "<p>Resetting the device will erase all configurations including WiFi settings.</p>";
+  html += "<p>Erase all configurations including WiFi settings.</p>";
   html += "<a href='/reset' onclick='return confirmReset()'><button class='danger-button'>Reset Device</button></a>";
   html += "</div>";
 
-  // Add button to reset calibration
   html += "<div class='danger-zone'>";
   html += "<h2>Calibration Reset</h2>";
-  html += "<p>Resetting calibration will erase the base gas value and restart the device to trigger calibration.</p>";
+  html += "<p>Erase the base gas value and restart the device to trigger calibration.</p>";
   html += "<a href='/reset-calibration'><button class='danger-button'>Reset Calibration</button></a>";
   html += "</div>";
 
-  // Add button to restart the device
   html += "<div class='danger-zone'>";
   html += "<h2>Restart Device</h2>";
-  html += "<p>Click the button below to restart the device.</p>";
+  html += "<p>Restart the device without erasing configurations.</p>";
   html += "<a href='/restart'><button class='danger-button'>Restart Device</button></a>";
+  html += "</div>";
+
+  html += "<div class='danger-zone'>";
+  html += "<h2>Reset WiFi Settings</h2>";
+  html += "<p>Resetting WiFi settings will erase the saved WiFi credentials and restart the device to display the captive portal.</p>";
+  html += "<a href='/reset-wifi'><button class='danger-button'>Reset WiFi Settings</button></a>";
   html += "</div>";
 
   html += "</body></html>";
@@ -977,10 +994,11 @@ void setup() {
   // Start Web Server
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
-  server.on("/regen", HTTP_GET, handleRegen);
+ 
   server.on("/reset", HTTP_GET, handleReset); // Add handler for reset
   server.on("/reset-calibration", HTTP_GET, handleResetCalibration); // Add handler for reset calibration
   server.on("/restart", HTTP_GET, handleRestart); // Add handler for restart
+  server.on("/reset-wifi", HTTP_GET, handleResetWiFi); // Add handler for resetting only WiFi settings
   server.begin();
   Serial.println("Web server started");
 
