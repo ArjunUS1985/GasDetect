@@ -97,6 +97,13 @@ const int numCalibrationReadings = 300; // 300 readings (one per second for 5 mi
 float calibrationReadings[300];
 int calibrationReadingCount = 0;
 
+// AP mode timeout and WiFi retry variables
+unsigned long apModeStartTime = 0;
+const unsigned long AP_MODE_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
+const unsigned long WIFI_RETRY_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
+unsigned long lastWifiRetryTime = 0;
+bool apModeTimedOut = false;
+
 // Forward declaration of publishMQTTData
 void publishMQTTData(int gasValue);
 
@@ -220,7 +227,12 @@ void loadConfig() {
   config.mqttEnabled = json["mqttEnabled"] | false;
   config.thresholdLimit = json["thresholdLimit"] | 200;
   config.thresholdDuration = json["thresholdDuration"] | 5;
-  strlcpy(config.topicName, json["topicName"] | "", sizeof(config.topicName));
+
+  // Default topicName to last 5 digits of MAC address if not set
+  String mac = WiFi.macAddress();
+  String defaultTopic = mac.substring(mac.length() - 5);
+  strlcpy(config.topicName, json["topicName"] | defaultTopic.c_str(), sizeof(config.topicName));
+
   config.ntfyEnabled = json["ntfyEnabled"] | true;  // Default to enabled for backwards compatibility
   config.baseGasValue = json["baseGasValue"] | -1; // Default to -1 if not set
   config.restartCounter = json["restartCounter"] | 0; // Default to 0 if not set
@@ -318,6 +330,26 @@ void handleReset() {
   Serial.println("Erasing configuration and restarting...");
   ESP.eraseConfig();
   delay(1000);
+  ESP.restart();
+}
+
+void handleResetCalibration() {
+  server.send(200, "text/html", "<html><body><h1>Resetting Calibration</h1><p>The device will now reset and calibration will be triggered.</p></body></html>");
+  delay(1000); // Give time for the response to be sent
+
+  // Reset baseGasValue to -1 to trigger calibration
+  config.baseGasValue = -1;
+  saveConfig();
+
+  // Restart the device
+  ESP.restart();
+}
+
+void handleRestart() {
+  server.send(200, "text/html", "<html><body><h1>Restarting Device</h1><p>The device will now restart.</p></body></html>");
+  delay(1000); // Give time for the response to be sent
+
+  // Restart the device
   ESP.restart();
 }
 
@@ -429,7 +461,7 @@ void handleRoot() {
   html += ".danger-button:hover { background: #c82333; }";
   html += ".danger-zone { margin-top: 2em; border-top: 1px solid #ddd; padding-top: 1em; }";
   html += "</style>";
-  
+
   // Add JavaScript for dynamic show/hide and reset confirmation
   html += "<script>";
   html += "function toggleMqttSettings() {";
@@ -441,12 +473,12 @@ void handleRoot() {
   html += "  return confirm('WARNING: This will erase all settings including WiFi credentials and reboot the device. Continue?');";
   html += "}";
   html += "</script></head><body>";
-  
+
   html += "<h1 style='text-align: center;'>Device Configuration</h1>";
   html += "<form action='/save' method='POST'>";
   html += "<label for='deviceName'>Device Name:</label>";
   html += "<input type='text' id='deviceName' name='deviceName' value='" + String(config.deviceName) + "'><br>";
-  
+
   html += "<label for='mqttEnabled'>Enable MQTT:</label>";
   html += "<input type='checkbox' id='mqttEnabled' name='mqttEnabled' value='1' onchange='toggleMqttSettings()'";
   if (config.mqttEnabled) {
@@ -487,14 +519,36 @@ void handleRoot() {
 
   html += "<input type='submit' value='Save'>";
   html += "</form>";
-  
+
+  // Add section to display raw value, adjustment value, and adjusted value
+  html += "<div class='info-section'>";
+  html += "<h2>Sensor Values</h2>";
+  html += "<p><strong>Raw Value:</strong> " + String(analogRead(gasSensorPin)) + "</p>";
+  html += "<p><strong>Adjustment Value:</strong> " + String(config.baseGasValue) + "</p>";
+  html += "<p><strong>Adjusted Value:</strong> " + String(analogRead(gasSensorPin) - config.baseGasValue) + "</p>";
+  html += "</div>";
+
   // Add danger zone with reset device button
   html += "<div class='danger-zone'>";
   html += "<h2>Danger Zone</h2>";
   html += "<p>Resetting the device will erase all configurations including WiFi settings.</p>";
   html += "<a href='/reset' onclick='return confirmReset()'><button class='danger-button'>Reset Device</button></a>";
   html += "</div>";
-  
+
+  // Add button to reset calibration
+  html += "<div class='danger-zone'>";
+  html += "<h2>Calibration Reset</h2>";
+  html += "<p>Resetting calibration will erase the base gas value and restart the device to trigger calibration.</p>";
+  html += "<a href='/reset-calibration'><button class='danger-button'>Reset Calibration</button></a>";
+  html += "</div>";
+
+  // Add button to restart the device
+  html += "<div class='danger-zone'>";
+  html += "<h2>Restart Device</h2>";
+  html += "<p>Click the button below to restart the device.</p>";
+  html += "<a href='/restart'><button class='danger-button'>Restart Device</button></a>";
+  html += "</div>";
+
   html += "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -709,6 +763,32 @@ void updateLedStatus() {
   }
 }
 
+void sendIpAddressNotification() {
+  if (WiFi.status() == WL_CONNECTED ) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+
+    String url = String("https://ntfy.sh/") + config.topicName;
+    String ipAddress = WiFi.localIP().toString();
+    String message = "Device IP Address: " + ipAddress;
+
+    Serial.printf("Sending IP address notification to ntfy topic: %s\n", url.c_str());
+    http.begin(client, url.c_str());
+    http.addHeader("Title", "Device IP Address");
+
+    int httpResponseCode = http.POST(message);
+    if (httpResponseCode > 0) {
+      Serial.printf("IP address notification sent successfully, HTTP code: %d\n", httpResponseCode);
+    } else {
+      Serial.printf("Failed to send IP address notification, HTTP error: %s\n", http.errorToString(httpResponseCode).c_str());
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi not connected or ntfy notifications disabled, skipping IP address notification");
+  }
+}
+
 void setup() {
 
   // Initialize LittleFS
@@ -764,11 +844,7 @@ void setup() {
   Serial.printf("Restart counter: %d\n", config.restartCounter);
   saveConfig();
   
-  // Generate initial topic if missing
-  if (config.topicName[0] == '\0') {
-    generateTopic();
-    saveConfig();
-  }
+  
   // Initialize serial communication for debugging
   Serial.begin(9600);
   
@@ -783,7 +859,11 @@ void setup() {
   // Initialize buzzer pin
   pinMode(buzzerPin, OUTPUT);
   digitalWrite(buzzerPin, LOW);  // Ensure buzzer is off initially
-
+//buzz the buzzer for 500 MS
+  digitalWrite(buzzerPin, HIGH); // Turn on the buzzer
+  delay(100);                   // Wait for 500 milliseconds
+  digitalWrite(buzzerPin, LOW);  // Turn off the buzzer
+  delay(1000);                   // Wait for 500 milliseconds
   // WiFiManager setup
   WiFiManager wifiManager;
   
@@ -793,32 +873,23 @@ void setup() {
   // Set connection timeout to 30 seconds
   wifiManager.setConnectTimeout(30);
   
-  // Uncomment to reset saved settings
-  // wifiManager.resetSettings();
+  // Set timeout for AP mode portal
+  wifiManager.setConfigPortalTimeout(300); // 5 minutes (300 seconds) timeout for AP mode
   
   // Set custom AP name
   String apName = "GasDetector-" + String(ESP.getChipId());
   
-  // Fetches ssid and password and tries to connect
-  // if it does not connect it starts an access point with the specified name
-  // and goes into a blocking loop awaiting configuration
+  // Try to connect to WiFi or start AP mode if needed
+  Serial.println("Attempting to connect to WiFi...");
   if (!wifiManager.autoConnect(apName.c_str())) {
-    if (wifiManager.startConfigPortal(apName.c_str())) {
-      Serial.println("WiFi configured through portal");
-     
-     
+    Serial.println("Failed to connect to WiFi and AP mode timed out");
+    Serial.println("Continuing in offline mode, will retry WiFi connection later");
+    // Set flag to indicate we're in offline mode after AP timeout
+    apModeTimedOut = true;
+    lastWifiRetryTime = millis();
   } else {
-    Serial.println("Failed to configure WiFi, continuing without WiFi");
-      
-      // We don't restart here - just continue without WiFi
+    Serial.println("Connected to WiFi");
   }
-  }
-  
-  Serial.println("Connected to WiFi");
-  // Wait for network to stabilize and show IP
-  delay(2000);
-  Serial.print("Local IP: ");
-  Serial.println(WiFi.localIP());
 
   // Ensure we are in station mode for mDNS
   WiFi.mode(WIFI_STA);
@@ -892,6 +963,9 @@ void setup() {
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
+  // Send IP address notification after reboot
+  sendIpAddressNotification();
+
   // Start Telnet server
   telnetServer.begin();
   telnetServer.setNoDelay(true);
@@ -905,6 +979,8 @@ void setup() {
   server.on("/save", HTTP_POST, handleSave);
   server.on("/regen", HTTP_GET, handleRegen);
   server.on("/reset", HTTP_GET, handleReset); // Add handler for reset
+  server.on("/reset-calibration", HTTP_GET, handleResetCalibration); // Add handler for reset calibration
+  server.on("/restart", HTTP_GET, handleRestart); // Add handler for restart
   server.begin();
   Serial.println("Web server started");
 
@@ -921,17 +997,51 @@ void setup() {
   }
 
   systemStartTime = millis(); // Record the system start time
-  //buzz the buzzer for 500 MS
-  digitalWrite(buzzerPin, HIGH); // Turn on the buzzer
-  delay(100);                   // Wait for 500 milliseconds
-  digitalWrite(buzzerPin, LOW);  // Turn off the buzzer
+  
 }
 
 void loop() {
   // Handle OTA updates
   ArduinoOTA.handle();
   unsigned long currentTime = millis();
-  
+  config.restartCounter = 0;
+  saveConfig();
+  // Check AP mode timeout and WiFi connection
+  if (!apModeTimedOut && WiFi.getMode() == WIFI_AP) {
+    if (currentTime - apModeStartTime >= AP_MODE_TIMEOUT) {
+      Serial.println("AP mode timeout reached. Switching to offline mode.");
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_STA);
+      apModeTimedOut = true;
+      lastWifiRetryTime = currentTime;
+    }
+    // While in active AP mode, don't proceed with normal loop execution
+    return;
+  }
+
+  // If we're in offline mode (AP timed out), periodically try to reconnect to WiFi
+  if (apModeTimedOut && WiFi.status() != WL_CONNECTED) {
+    if (currentTime - lastWifiRetryTime >= WIFI_RETRY_INTERVAL) {
+      Serial.println("Trying to reconnect to WiFi...");
+      // Use WiFi.begin() without parameters to reconnect using stored credentials
+      WiFi.begin();
+      
+      // Wait for connection for a reasonable time (e.g., 10 seconds)
+      unsigned long connectStart = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - connectStart < 10000) {
+        delay(500);
+        Serial.print(".");
+      }
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nConnected to WiFi!");
+      } else {
+        Serial.println("\nFailed to connect to WiFi, continuing in offline mode");
+      }
+      
+      lastWifiRetryTime = currentTime;
+    }
+  }
   
   // Accept new Telnet client using accept() instead of available
   if (telnetServer.hasClient()) {
@@ -1029,8 +1139,7 @@ void loop() {
     // Normal operation after warmup
     // Update LED status (non-blocking)
     updateLedStatus();
-    config.restartCounter = 0;
-    saveConfig();
+    
     // Read and publish sensor data every second without blocking
     if (now - lastReadingTime >= 1000) {
       lastReadingTime = now;
@@ -1050,7 +1159,9 @@ void loop() {
       //  telnetClient.printf("Gas Sensor Value: %.2f\n", gasReading);
       //}
       Serial.printf("Gas Sensor Value: %.2f (raw: %.2f, base: %d)\n", gasReading, rawGasReading, config.baseGasValue);
-      
+      if (telnetClient && telnetClient.connected()) {
+        telnetClient.printf("Gas Sensor Value: %.2f (raw: %.2f, base: %d)\n", gasReading, rawGasReading, config.baseGasValue);
+      }
       // Add gas sensor value to buffer
       addGasReading(gasReading);
       printGasDataBuffer();
