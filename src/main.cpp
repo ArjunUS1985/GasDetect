@@ -17,6 +17,11 @@ WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 ESP8266WebServer server(80);
 
+WiFiClientSecure *secureClient = nullptr;
+HTTPClient *httpClient = nullptr;
+const char ALERT_MESSAGE[] PROGMEM = "Gas leak detected! Please take immediate action.";
+const char NORMAL_MESSAGE[] PROGMEM = "Gas sensor reading is back to normal.";
+
 struct Config {
   char mqttServer[40];
   char mqttUser[40];
@@ -110,39 +115,58 @@ void publishMQTTData(int gasValue);
 // Add function prototype at the top of the file, before it's used:
 void setLedColor(bool r, bool g, bool b);
 
-void sendNotification(bool isAlert) {
-  
-    if (WiFi.status() == WL_CONNECTED ) {
-      WiFiClientSecure client;
-      client.setInsecure();
-      HTTPClient http;
-  
-      String url = String("https://ntfy.sh/") + config.topicName;
-      
-      String message ;
-      if(isAlert) {
-        message = "Gas leak detected! Please take immediate action.";
-      } else {
-        message = "Gas sensor reading is back to normal.";
-      }
-      message= "Gas leak detected";
-  
-      Serial.printf("Sending IP address notification to ntfy topic: %s\n", url.c_str());
-      http.begin(client, url.c_str());
-      http.addHeader("Title", "Device IP Address");
-  
-      int httpResponseCode = http.POST(message);
-      if (httpResponseCode > 0) {
-        Serial.printf("Notification sent successfully, HTTP code: %d\n", httpResponseCode);
-      } else {
-        Serial.printf("Notification Failed, HTTP error: %s\n", http.errorToString(httpResponseCode).c_str());
-      }
-      http.end();
-    } else {
-      Serial.println("WiFi not connected or ntfy notifications disabled, skipping IP address notification");
+void setupNotifications() {
+    if (secureClient == nullptr) {
+        secureClient = new WiFiClientSecure();
+        secureClient->setInsecure();
     }
-  } 
+    if (httpClient == nullptr) {
+        httpClient = new HTTPClient();
+    }
+}
 
+void sendNotification(bool isAlert) {
+    //if (!(WiFi.status() == WL_CONNECTED) || !config.ntfyEnabled) {
+    //    Serial.println("WiFi not connected or ntfy notifications disabled, skipping notification");
+    //    return;
+    //}
+//
+    //if (secureClient == nullptr || httpClient == nullptr) {
+    //    setupNotifications();
+    //}
+//
+    //String url = String(F("https://ntfy.sh/")) + config.topicName;
+    //
+    //if (!httpClient->begin(*secureClient, url)) {
+    //    Serial.println(F("Failed to begin HTTP client"));
+    //    return;
+    //}
+//
+    //httpClient->addHeader(F("Title"), F("Gas Detector Alert"));
+    //httpClient->addHeader(F("Content-Type"), F("text/plain"));
+    //
+    //const char* message = isAlert ? ALERT_MESSAGE : NORMAL_MESSAGE;
+    //int httpResponseCode = httpClient->POST(message);
+    //
+    //if (httpResponseCode > 0) {
+    //    Serial.printf_P(PSTR("Notification sent successfully, HTTP code: %d\n"), httpResponseCode);
+    //} else {
+    //    Serial.printf_P(PSTR("Notification Failed, HTTP error: %s\n"), httpClient->errorToString(httpResponseCode).c_str());
+    //}
+    //
+    //httpClient->end();
+}
+
+void cleanup() {
+    if (httpClient) {
+        delete httpClient;
+        httpClient = nullptr;
+    }
+    if (secureClient) {
+        delete secureClient;
+        secureClient = nullptr;
+    }
+}
 
 void addGasReading(float gasReading) {
   //print reading to telnet
@@ -252,7 +276,7 @@ void loadConfig() {
   Serial.printf("Threshold Duration: %d\n", config.thresholdDuration);
   Serial.printf("Topic Name: %s\n", config.topicName);
   Serial.printf("NTFY Enabled: %s\n", config.ntfyEnabled ? "true" : "false");
-  Serial.printf("Base Gas Value: %.2f\n", config.baseGasValue);
+  Serial.printf("Base Gas Value: %d\n", config.baseGasValue);
   Serial.printf("Restart Counter: %d\n", config.restartCounter);
 }
 
@@ -558,6 +582,17 @@ void handleRoot() {
   html += "<h2>Device Information</h2>";
   html += "<p><strong>IP Address:</strong><span>" + WiFi.localIP().toString() + "</span></p>";
   html += "<p><strong>MAC Address:</strong><span>" + WiFi.macAddress() + "</span></p>";
+  
+  // Add memory information
+  uint32_t freeHeap = ESP.getFreeHeap();
+  uint32_t maxFreeBlock = ESP.getMaxFreeBlockSize();
+  uint32_t freeSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+  uint32_t flashChipSize = ESP.getFlashChipSize();
+  
+  html += "<p><strong>Free RAM:</strong><span>" + String(freeHeap) + " bytes</span></p>";
+  html += "<p><strong>Largest Free Block:</strong><span>" + String(maxFreeBlock) + " bytes</span></p>";
+  html += "<p><strong>Free Sketch Space:</strong><span>" + String(freeSketchSpace) + " bytes (" + String((freeSketchSpace * 100) / flashChipSize) + "%)</span></p>";
+  html += "<p><strong>Flash Chip Size:</strong><span>" + String(flashChipSize) + " bytes</span></p>";
   html += "</div>";
 
   html += "<div class='info-section'>";
@@ -923,6 +958,7 @@ void sendIpAddressNotification() {
 }
 
 void setup() {
+  Serial.begin(9600);
 
   // Initialize LittleFS
   if (!LittleFS.begin()) {
@@ -979,7 +1015,6 @@ void setup() {
   
   
   // Initialize serial communication for debugging
-  Serial.begin(9600);
   
   // Initialize LED pins
   pinMode(redPin, OUTPUT);
@@ -1097,7 +1132,7 @@ void setup() {
   Serial.println(WiFi.localIP());
 
   // Send IP address notification after reboot
-  sendIpAddressNotification();
+  //sendIpAddressNotification();
 
   // Start Telnet server
   telnetServer.begin();
