@@ -705,7 +705,7 @@ void handleUpdatePage() {
   html += "  try {";
   html += "    status.textContent = 'Downloading firmware...';";
   html += "    progress.style.display = 'block';";
-  html += "    const response = await fetch('https://arjunus1985.github.io/DeskClock/fwroot/firmware.bin');";
+  html += "    const response = await fetch('https://arjunus1985.github.io/GasDetect/fwroot/firmware.bin');";
   html += "    const firmware = await response.arrayBuffer();";
   html += "    const formData = new FormData();";
   html += "    formData.append('firmware', new Blob([firmware]), 'firmware.bin');";
