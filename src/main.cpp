@@ -567,6 +567,12 @@ void handleRoot() {
   html += "<p><strong>Adjusted Value:</strong><span>" + String(analogRead(gasSensorPin) - config.baseGasValue) + "</span></p>";
   html += "</div>";
 
+  html += "<div class='info-section'>";
+  html += "<h2>Firmware Update</h2>";
+  html += "<p>Download and install latest firmware from GitHub.</p>";
+  html += "<a href='/update'><button style='background-color: #28a745;'>Update Firmware</button></a>";
+  html += "</div>";
+
   html += "<div class='danger-zone'>";
   html += "<h2>Danger Zone</h2>";
   html += "<p>Erase all configurations including WiFi settings.</p>";
@@ -651,6 +657,91 @@ void handleSave() {
   }
   
   server.send(200, "text/html", "<html><body><h1>Configuration Saved</h1><a href='/'>Go Back</a></body></html>");
+}
+
+void handleUpdate() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.println("Update: " + String(upload.filename));
+    uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+    if (!Update.begin(maxSketchSpace)) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      Serial.println("Update Success: " + String(upload.totalSize));
+      server.send(200, "text/plain", "Update successful! Rebooting...");
+      delay(1000);
+      ESP.restart();
+    } else {
+      Update.printError(Serial);
+    }
+  }
+  yield();
+}
+
+void handleUpdatePage() {
+  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f4f4f9; color: #333; }";
+  html += "h1 { text-align: center; color: #444; }";
+  html += ".update-container { max-width: 600px; margin: 0 auto; padding: 20px; background: #fff; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }";
+  html += ".progress { width: 100%; height: 20px; background: #eee; border-radius: 10px; margin: 20px 0; display: none; }";
+  html += ".progress-bar { width: 0%; height: 100%; background: #28a745; border-radius: 10px; transition: width 0.3s; }";
+  html += "button { width: 100%; background: #28a745; color: white; border: none; padding: 10px; border-radius: 5px; cursor: pointer; font-size: 16px; }";
+  html += "button:hover { background: #218838; }";
+  html += ".status { text-align: center; margin: 10px 0; }";
+  html += "</style>";
+
+  html += "<script>";
+  html += "async function startUpdate() {";
+  html += "  const status = document.getElementById('status');";
+  html += "  const progress = document.getElementById('progress');";
+  html += "  const progressBar = document.getElementById('progressBar');";
+  html += "  try {";
+  html += "    status.textContent = 'Downloading firmware...';";
+  html += "    progress.style.display = 'block';";
+  html += "    const response = await fetch('https://arjunus1985.github.io/DeskClock/fwroot/firmware.bin');";
+  html += "    const firmware = await response.arrayBuffer();";
+  html += "    const formData = new FormData();";
+  html += "    formData.append('firmware', new Blob([firmware]), 'firmware.bin');";
+  html += "    status.textContent = 'Uploading firmware to device...';";
+  html += "    progressBar.style.width = '50%';";
+  html += "    const updateResponse = await fetch('/do-update', {";
+  html += "      method: 'POST',";
+  html += "      body: formData";
+  html += "    });";
+  html += "    if (updateResponse.ok) {";
+  html += "      status.textContent = 'Update successful! Device will restart...';";
+  html += "      progressBar.style.width = '100%';";
+  html += "      setTimeout(() => { window.location.href = '/'; }, 5000);";
+  html += "    } else {";
+  html += "      throw new Error('Update failed');";
+  html += "    }";
+  html += "  } catch (error) {";
+  html += "    status.textContent = 'Error: ' + error.message;";
+  html += "    progressBar.style.background = '#dc3545';";
+  html += "  }";
+  html += "}";
+  html += "</script></head><body>";
+
+  html += "<div class='update-container'>";
+  html += "<h1>Firmware Update</h1>";
+  html += "<p>This will download and install the latest firmware from GitHub.</p>";
+  html += "<button onclick='startUpdate()'>Start Update</button>";
+  html += "<div id='progress' class='progress'>";
+  html += "<div id='progressBar' class='progress-bar'></div>";
+  html += "</div>";
+  html += "<div id='status' class='status'></div>";
+  html += "<p><a href='/'>&larr; Back to main page</a></p>";
+  html += "</div>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
 }
 
 // Callback for when device enters config mode
@@ -1024,6 +1115,12 @@ void setup() {
   server.on("/reset-calibration", HTTP_GET, handleResetCalibration); // Add handler for reset calibration
   server.on("/restart", HTTP_GET, handleRestart); // Add handler for restart
   server.on("/reset-wifi", HTTP_GET, handleResetWiFi); // Add handler for resetting only WiFi settings
+  server.on("/update", HTTP_GET, handleUpdatePage);  // New route for update page
+  server.on("/do-update", HTTP_POST, []() {
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+    ESP.restart();
+  }, handleUpdate);
   server.begin();
   Serial.println("Web server started");
 
