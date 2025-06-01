@@ -110,32 +110,39 @@ void publishMQTTData(int gasValue);
 // Add function prototype at the top of the file, before it's used:
 void setLedColor(bool r, bool g, bool b);
 
-void sendNotification(const String &msg) {
-  // Enable alert state which will trigger beeping in loop
-  alertState = true;
+void sendNotification(bool isAlert) {
   
-  // Only send notification if ntfy is enabled
-  if (config.ntfyEnabled) {
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    // Build ntfy URL
-    String url = String("https://ntfy.sh/") + config.topicName;
-    Serial.printf("Sending notification to ntfy topic: %s\n", url.c_str());
-    http.begin(client, url.c_str());  // use C-string overload
-    http.addHeader("Title", "Gas Alert");
-   
-    int httpResponseCode = http.POST(msg);
-    if (httpResponseCode > 0) {
-      Serial.printf("Notification sent successfully, HTTP code: %d\n", httpResponseCode);
+    if (WiFi.status() == WL_CONNECTED ) {
+      WiFiClientSecure client;
+      client.setInsecure();
+      HTTPClient http;
+  
+      String url = String("https://ntfy.sh/") + config.topicName;
+      
+      String message ;
+      if(isAlert) {
+        message = "Gas leak detected! Please take immediate action.";
+      } else {
+        message = "Gas sensor reading is back to normal.";
+      }
+      message= "Gas leak detected";
+  
+      Serial.printf("Sending IP address notification to ntfy topic: %s\n", url.c_str());
+      http.begin(client, url.c_str());
+      http.addHeader("Title", "Device IP Address");
+  
+      int httpResponseCode = http.POST(message);
+      if (httpResponseCode > 0) {
+        Serial.printf("Notification sent successfully, HTTP code: %d\n", httpResponseCode);
+      } else {
+        Serial.printf("Notification Failed, HTTP error: %s\n", http.errorToString(httpResponseCode).c_str());
+      }
+      http.end();
     } else {
-      Serial.printf("Failed to send notification, HTTP error: %s\n", http.errorToString(httpResponseCode).c_str());
+      Serial.println("WiFi not connected or ntfy notifications disabled, skipping IP address notification");
     }
-    http.end();
-  } else {
-    Serial.println("NTFY notifications disabled, skipping notification");
-  }
-}
+  } 
+
 
 void addGasReading(float gasReading) {
   //print reading to telnet
@@ -192,6 +199,9 @@ void saveConfig() {
   if (serializeJson(json, configFile) == 0) {
     Serial.println("Failed to write to config file");
   }
+  else {
+    Serial.println("Configuration saved successfully");
+  }
 
   configFile.close();
 }
@@ -229,6 +239,21 @@ void loadConfig() {
   config.restartCounter = json["restartCounter"] | 0; // Default to 0 if not set
 
   configFile.close();
+  //print all config values on serial
+  Serial.println("Loaded configuration:");
+
+  Serial.printf("MQTT Server: %s\n", config.mqttServer);
+  Serial.printf("MQTT User: %s\n", config.mqttUser);
+  Serial.printf("MQTT Password: %s\n", config.mqttPassword);
+  Serial.printf("Device Name: %s\n", config.deviceName);
+  Serial.printf("MQTT Port: %d\n", config.mqttPort);
+  Serial.printf("MQTT Enabled: %s\n", config.mqttEnabled ? "true" : "false");
+  Serial.printf("Threshold Limit: %d\n", config.thresholdLimit);
+  Serial.printf("Threshold Duration: %d\n", config.thresholdDuration);
+  Serial.printf("Topic Name: %s\n", config.topicName);
+  Serial.printf("NTFY Enabled: %s\n", config.ntfyEnabled ? "true" : "false");
+  Serial.printf("Base Gas Value: %.2f\n", config.baseGasValue);
+  Serial.printf("Restart Counter: %d\n", config.restartCounter);
 }
 
 // Function to handle calibration LED pattern
@@ -1015,15 +1040,15 @@ void setup() {
   }
 
   systemStartTime = millis(); // Record the system start time
-  
+  config.restartCounter = 0;
+  saveConfig();
 }
 
 void loop() {
   // Handle OTA updates
   ArduinoOTA.handle();
   unsigned long currentTime = millis();
-  config.restartCounter = 0;
-  saveConfig();
+  
   // Check AP mode timeout and WiFi connection
   if (!apModeTimedOut && WiFi.getMode() == WIFI_AP) {
     if (currentTime - apModeStartTime >= AP_MODE_TIMEOUT) {
@@ -1196,7 +1221,7 @@ void loop() {
         if (now - breachStart >= (unsigned long)config.thresholdDuration * 1000) {
           alertState = true;  // Enable alert state with beeping
           if (lastNotificationTime == 0 || now - lastNotificationTime >= 30000) {
-            sendNotification("Gas leak alert!!");
+            sendNotification(true);
             lastNotificationTime = now;
           }
         }
@@ -1209,7 +1234,7 @@ void loop() {
         if (now - underThresholdStart >= (unsigned long)config.thresholdDuration * 1000) {
           // send alert cleared notification
           if (breachStart != 0) {
-            sendNotification("Gas level back under threshold");
+            sendNotification(false);
             alertState = false;  // Disable alert state, stop beeping
           }
           breachStart = 0;
