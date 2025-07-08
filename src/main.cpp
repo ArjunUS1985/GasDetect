@@ -11,6 +11,12 @@
 #include <ESP8266HTTPClient.h>  // for ntfy notifications
 #include <WiFiClientSecureBearSSL.h>
 
+// Forward declaration for printBoth
+void printBoth(const String& msg);
+
+// Forward declaration for publishDiscoveryConfig
+void publishDiscoveryConfig();
+
 WiFiServer telnetServer(23);
 WiFiClient telnetClient;
 WiFiClient espClient;
@@ -37,7 +43,81 @@ struct Config {
   int restartCounter = 0;   // Counter for quick restarts
 };
 
+struct MQTTConfig {
+    char mqtt_server[40] = "";
+    int mqtt_port = 1883;
+    char mqtt_user[32] = "";
+    char mqtt_password[32] = "";
+    bool isEmpty() const { return mqtt_server[0] == '\0' || mqtt_port == 0; }
+};
+MQTTConfig mqttConfig;
+
 Config config;
+
+void setDefaultMQTTConfig() {
+    memset(&mqttConfig, 0, sizeof(MQTTConfig));
+    mqttConfig.mqtt_port = 1883;
+}
+
+void loadMQTTConfig() {
+    if (!LittleFS.begin()) {
+        printBoth("Failed to mount file system");
+        setDefaultMQTTConfig();
+        return;
+    }
+    if (!LittleFS.exists("/mqtt_config.json")) {
+        printBoth("No MQTT config file found");
+        setDefaultMQTTConfig();
+        return;
+    }
+    File configFile = LittleFS.open("/mqtt_config.json", "r");
+    if (!configFile) {
+        printBoth("Failed to open MQTT config file");
+        setDefaultMQTTConfig();
+        return;
+    }
+    StaticJsonDocument<200> doc;
+    DeserializationError error = deserializeJson(doc, configFile);
+    configFile.close();
+    if (error) {
+        printBoth("Failed to parse MQTT config file");
+        setDefaultMQTTConfig();
+        return;
+    }
+    if (doc.containsKey("server") && doc.containsKey("port")) {
+        strncpy(mqttConfig.mqtt_server, doc["server"], sizeof(mqttConfig.mqtt_server) - 1);
+        mqttConfig.mqtt_port = doc["port"].as<int>();
+        if (doc.containsKey("user")) {
+            strncpy(mqttConfig.mqtt_user, doc["user"], sizeof(mqttConfig.mqtt_user) - 1);
+        }
+        if (doc.containsKey("password")) {
+            strncpy(mqttConfig.mqtt_password, doc["password"], sizeof(mqttConfig.mqtt_password) - 1);
+        }
+    } else {
+        setDefaultMQTTConfig();
+    }
+}
+
+void saveMQTTConfig() {
+    if (!LittleFS.begin()) {
+        printBoth("Failed to mount file system");
+        return;
+    }
+    StaticJsonDocument<200> doc;
+    doc["server"] = mqttConfig.mqtt_server;
+    doc["port"] = mqttConfig.mqtt_port;
+    doc["user"] = mqttConfig.mqtt_user;
+    doc["password"] = mqttConfig.mqtt_password;
+    File configFile = LittleFS.open("/mqtt_config.json", "w");
+    if (!configFile) {
+        printBoth("Failed to open MQTT config file for writing");
+        return;
+    }
+    if (serializeJson(doc, configFile) == 0) {
+        printBoth("Failed to write MQTT config file");
+    }
+    configFile.close();
+}
 
 // Threshold breach tracking
 unsigned long breachStart = 0;
@@ -109,25 +189,44 @@ const unsigned long WIFI_RETRY_INTERVAL = 5 * 60 * 1000; // 5 minutes in millise
 unsigned long lastWifiRetryTime = 0;
 bool apModeTimedOut = false;
 
+// Discovery config publish variables
+unsigned long lastDiscoveryPublish = 0;
+const unsigned long discoveryPublishInterval = 5 * 60 * 1000; // 5 minutes
+
 // Forward declaration of publishMQTTData
 void publishMQTTData(int gasValue);
 
 // Add function prototype at the top of the file, before it's used:
 void setLedColor(bool r, bool g, bool b);
 
-void setupNotifications() {
-    if (secureClient == nullptr) {
-        secureClient = new WiFiClientSecure();
-        secureClient->setInsecure();
+// Add these helper functions near the top of the file
+void printBoth(const String& msg) {
+    Serial.print(msg);
+    if (telnetClient && telnetClient.connected()) {
+        telnetClient.print(msg);
     }
-    if (httpClient == nullptr) {
-        httpClient = new HTTPClient();
+}
+void printlnBoth(const String& msg) {
+    Serial.println(msg);
+    if (telnetClient && telnetClient.connected()) {
+        telnetClient.println(msg);
+    }
+}
+void printfBoth(const char* fmt, ...) {
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    Serial.print(buf);
+    if (telnetClient && telnetClient.connected()) {
+        telnetClient.print(buf);
     }
 }
 
 void sendNotification(bool isAlert) {
     //if (!(WiFi.status() == WL_CONNECTED) || !config.ntfyEnabled) {
-    //    Serial.println("WiFi not connected or ntfy notifications disabled, skipping notification");
+    //    printlnBoth("WiFi not connected or ntfy notifications disabled, skipping notification");
     //    return;
     //}
 //
@@ -138,7 +237,7 @@ void sendNotification(bool isAlert) {
     //String url = String(F("https://ntfy.sh/")) + config.topicName;
     //
     //if (!httpClient->begin(*secureClient, url)) {
-    //    Serial.println(F("Failed to begin HTTP client"));
+    //    printlnBoth(F("Failed to begin HTTP client"));
     //    return;
     //}
 //
@@ -149,30 +248,19 @@ void sendNotification(bool isAlert) {
     //int httpResponseCode = httpClient->POST(message);
     //
     //if (httpResponseCode > 0) {
-    //    Serial.printf_P(PSTR("Notification sent successfully, HTTP code: %d\n"), httpResponseCode);
+    //    printfBoth(PSTR("Notification sent successfully, HTTP code: %d\n"), httpResponseCode);
     //} else {
-    //    Serial.printf_P(PSTR("Notification Failed, HTTP error: %s\n"), httpClient->errorToString(httpResponseCode).c_str());
+    //    printfBoth(PSTR("Notification Failed, HTTP error: %s\n"), httpClient->errorToString(httpResponseCode).c_str());
     //}
     //
     //httpClient->end();
-}
-
-void cleanup() {
-    if (httpClient) {
-        delete httpClient;
-        httpClient = nullptr;
-    }
-    if (secureClient) {
-        delete secureClient;
-        secureClient = nullptr;
-    }
 }
 
 void addGasReading(float gasReading) {
   //print reading to telnet
   if (telnetClient && telnetClient.connected()) {
     telnetClient.printf("Gas Sensor Value: %.2f\n", gasReading);
-    Serial.printf("Gas Sensor Value: %.2f\n", gasReading);
+    printfBoth("Gas Sensor Value: %.2f\n", gasReading);
   }
 
   // Shift elements to the left
@@ -202,7 +290,7 @@ float calculateMedian(float data[], int size) {
 void saveConfig() {
   File configFile = LittleFS.open("/config.json", "w");
   if (!configFile) {
-    Serial.println("Failed to open config file for writing");
+    printlnBoth("Failed to open config file for writing");
     return;
   }
 
@@ -221,10 +309,10 @@ void saveConfig() {
   json["restartCounter"] = config.restartCounter;  // Save restart counter
 
   if (serializeJson(json, configFile) == 0) {
-    Serial.println("Failed to write to config file");
+    printlnBoth("Failed to write to config file");
   }
   else {
-    Serial.println("Configuration saved successfully");
+    printlnBoth("Configuration saved successfully");
   }
 
   configFile.close();
@@ -233,14 +321,14 @@ void saveConfig() {
 void loadConfig() {
   File configFile = LittleFS.open("/config.json", "r");
   if (!configFile) {
-    Serial.println("Failed to open config file");
+    printlnBoth("Failed to open config file");
     return;
   }
 
   JsonDocument json;
   DeserializationError error = deserializeJson(json, configFile);
   if (error) {
-    Serial.println("Failed to parse config file");
+    printlnBoth("Failed to parse config file");
     return;
   }
 
@@ -264,20 +352,20 @@ void loadConfig() {
 
   configFile.close();
   //print all config values on serial
-  Serial.println("Loaded configuration:");
+  printlnBoth("Loaded configuration:");
 
-  Serial.printf("MQTT Server: %s\n", config.mqttServer);
-  Serial.printf("MQTT User: %s\n", config.mqttUser);
-  Serial.printf("MQTT Password: %s\n", config.mqttPassword);
-  Serial.printf("Device Name: %s\n", config.deviceName);
-  Serial.printf("MQTT Port: %d\n", config.mqttPort);
-  Serial.printf("MQTT Enabled: %s\n", config.mqttEnabled ? "true" : "false");
-  Serial.printf("Threshold Limit: %d\n", config.thresholdLimit);
-  Serial.printf("Threshold Duration: %d\n", config.thresholdDuration);
-  Serial.printf("Topic Name: %s\n", config.topicName);
-  Serial.printf("NTFY Enabled: %s\n", config.ntfyEnabled ? "true" : "false");
-  Serial.printf("Base Gas Value: %d\n", config.baseGasValue);
-  Serial.printf("Restart Counter: %d\n", config.restartCounter);
+  printfBoth("MQTT Server: %s\n", config.mqttServer);
+  printfBoth("MQTT User: %s\n", config.mqttUser);
+  printfBoth("MQTT Password: %s\n", config.mqttPassword);
+  printfBoth("Device Name: %s\n", config.deviceName);
+  printfBoth("MQTT Port: %d\n", config.mqttPort);
+  printfBoth("MQTT Enabled: %s\n", config.mqttEnabled ? "true" : "false");
+  printfBoth("Threshold Limit: %d\n", config.thresholdLimit);
+  printfBoth("Threshold Duration: %d\n", config.thresholdDuration);
+  printfBoth("Topic Name: %s\n", config.topicName);
+  printfBoth("NTFY Enabled: %s\n", config.ntfyEnabled ? "true" : "false");
+  printfBoth("Base Gas Value: %d\n", config.baseGasValue);
+  printfBoth("Restart Counter: %d\n", config.restartCounter);
 }
 
 // Function to handle calibration LED pattern
@@ -326,28 +414,28 @@ void handleReset() {
   server.send(200, "text/html", "<html><body><h1>Resetting Device</h1><p>The device will now reset and all configurations will be wiped.</p></body></html>");
   delay(1000); // Give time for the response to be sent
 
-  Serial.println("Performing factory reset...");
+  printlnBoth("Performing factory reset...");
 
   // Clear stored configurations - with error checking
   if (LittleFS.exists("/config.json")) {
     if (LittleFS.remove("/config.json")) {
-      Serial.println("Config file deleted successfully");
+      printlnBoth("Config file deleted successfully");
     } else {
-      Serial.println("Failed to delete config file");
+      printlnBoth("Failed to delete config file");
     }
   } else {
-    Serial.println("Config file not found");
+    printlnBoth("Config file not found");
   }
   
   // Clear WiFi settings by removing the wifi config file
   if (LittleFS.exists("/wifi_cred.dat")) {
     if (LittleFS.remove("/wifi_cred.dat")) {
-      Serial.println("WiFi credentials file deleted successfully");
+      printlnBoth("WiFi credentials file deleted successfully");
     } else {
-      Serial.println("Failed to delete WiFi credentials file");
+      printlnBoth("Failed to delete WiFi credentials file");
     }
   } else {
-    Serial.println("WiFi credentials file not found");
+    printlnBoth("WiFi credentials file not found");
   }
   
   // Ensure the filesystem has time to complete operations
@@ -358,11 +446,11 @@ void handleReset() {
   WiFi.disconnect(true);  // disconnect and delete credentials
   
   // Wait for WiFi disconnect to complete
-  Serial.println("Disconnecting WiFi...");
+  printlnBoth("Disconnecting WiFi...");
   delay(1000);
   
   // Erase config and reset
-  Serial.println("Erasing configuration and restarting...");
+  printlnBoth("Erasing configuration and restarting...");
   ESP.eraseConfig();
   delay(1000);
   ESP.restart();
@@ -373,17 +461,17 @@ void handleResetWiFi() {
   delay(1000); // Give time for the response to be sent
   WiFi.disconnect(true); // Disconnect from Wi-Fi
   ESP.eraseConfig(); // Erase all Wi-Fi and network-related settings
-  Serial.println("Resetting WiFi settings...");
+  printlnBoth("Resetting WiFi settings...");
 
   // Clear WiFi settings by removing the WiFi credentials file
   if (LittleFS.exists("/wifi_cred.dat")) {
     if (LittleFS.remove("/wifi_cred.dat")) {
-      Serial.println("WiFi credentials file deleted successfully");
+      printlnBoth("WiFi credentials file deleted successfully");
     } else {
-      Serial.println("Failed to delete WiFi credentials file");
+      printlnBoth("Failed to delete WiFi credentials file");
     }
   } else {
-    Serial.println("WiFi credentials file not found");
+    printlnBoth("WiFi credentials file not found");
   }
 
  
@@ -415,99 +503,126 @@ void handleRestart() {
 }
 
 void setupMQTT() {
- // loadMQTTConfig();
-  
-  if (!config.mqttEnabled) {
-      Serial.println("MQTT disabled");
-      return;
-  }
-
-  mqttClient.setServer(config.mqttServer, config.mqttPort);
-  //mqttClient.setCallback(mqttCallback);
-  
- // printBothf("Attempting to connect to MQTT broker as %s...", deviceConfig.hostname);
-  if (mqttClient.connect(config.mqttServer, config.mqttUser, config.mqttPassword)) {
-     // printBoth("MQTT Connected Successfully");
-      
-    
-      // Publish discovery configs for gas sensor
-     // Define base topic for this device
-     String baseTopic = "homeassistant/sensor/" + String(config.deviceName) + "/gas";
-     String stateTopic = baseTopic + "/state";
-     
-     // Create discovery config
-     String configTopic = baseTopic + "/config";
-     String configPayload = "{\"name\":\"" + String(config.deviceName) + " Gas Sensor\",\"device_class\":\"gas\",\"state_topic\":\"" + stateTopic + "\",\"unit_of_measurement\":\"ppm\",\"unique_id\":\"" + String(config.deviceName) + "_gas\"}";
-   // Add small delay between connection and first publish
-   delay(100);
-        
-   bool pubSuccess = mqttClient.publish(configTopic.c_str(), configPayload.c_str(), true);
-   
-   if (telnetClient && telnetClient.connected()) {
-     telnetClient.printf("MQTT: Discovery config publish %s\n", pubSuccess ? "successful" : "failed");
-   }
-     // mqttClient.subscribe(("homeassistant/" + String(config.deviceName) + "/command").c_str());
-  } else {
-      int state = mqttClient.state();
-      String errorMsg = "Initial MQTT connection failed, state: ";
-      switch (state) {
-          case -4: errorMsg += "MQTT_CONNECTION_TIMEOUT"; break;
-          case -3: errorMsg += "MQTT_CONNECTION_LOST"; break;
-          case -2: errorMsg += "MQTT_CONNECT_FAILED"; break;
-          case -1: errorMsg += "MQTT_DISCONNECTED"; break;
-          case 1: errorMsg += "MQTT_CONNECT_BAD_PROTOCOL"; break;
-          case 2: errorMsg += "MQTT_CONNECT_BAD_CLIENT_ID"; break;
-          case 3: errorMsg += "MQTT_CONNECT_UNAVAILABLE"; break;
-          case 4: errorMsg += "MQTT_CONNECT_BAD_CREDENTIALS"; break;
-          case 5: errorMsg += "MQTT_CONNECT_UNAUTHORIZED"; break;
-          default: errorMsg += String(state);
-      }
-    //  printBoth(errorMsg);
-     // printBoth("Will retry in main loop");
-  }
-}
-void reconnectMQTT() {
-  // Skip if MQTT is not configured or if server name is empty
-  if (!mqttClient.connected() && config.mqttEnabled) {
-    // First check if we have a valid network connection
-    if (WiFi.status() != WL_CONNECTED) {
-      if (telnetClient && telnetClient.connected()) {
-        telnetClient.println("MQTT: WiFi not connected, skipping MQTT connection attempt");
-      }
-      return;
+    loadMQTTConfig();
+    if (mqttConfig.isEmpty()) {
+        printBoth("No MQTT configuration found - MQTT disabled");
+        return;
     }
-
-  // Check if we're already connected
-  if (mqttClient.connected()) {
-    telnetClient.println("MQTT Connected");
-      return;  // Already connected, nothing to do
-  }
-
-  // Try to connect once (non-blocking approach)
-  telnetClient.println("Attempting MQTT connection as ");
-  if (mqttClient.connect(config.mqttServer, config.mqttUser, config.mqttPassword)) {
-      
-    //  mqttClient.subscribe(("homeassistant/" + String(deviceConfig.hostname) + "/command").c_str());
-  } else {
-      int state = mqttClient.state();
-      String errorMsg = "Connection failed, state: ";
-      switch (state) {
-          case -4: errorMsg += "MQTT_CONNECTION_TIMEOUT"; break;
-          case -3: errorMsg += "MQTT_CONNECTION_LOST"; break;
-          case -2: errorMsg += "MQTT_CONNECT_FAILED"; break;
-          case -1: errorMsg += "MQTT_DISCONNECTED"; break;
-          case 1: errorMsg += "MQTT_CONNECT_BAD_PROTOCOL"; break;
-          case 2: errorMsg += "MQTT_CONNECT_BAD_CLIENT_ID"; break;
-          case 3: errorMsg += "MQTT_CONNECT_UNAVAILABLE"; break;
-          case 4: errorMsg += "MQTT_CONNECT_BAD_CREDENTIALS"; break;
-          case 5: errorMsg += "MQTT_CONNECT_UNAUTHORIZED"; break;
-          default: errorMsg += String(state);
-      }
-      //printBoth(errorMsg);
-     // printBoth("Will try again later");
-      // No delay here - the function will return and the main loop will continue
-  }
+    // Use device name or fallback to MAC for client ID and topic
+    String hostname = String(config.deviceName);
+    if (hostname.length() == 0) {
+        hostname = WiFi.macAddress();
+        hostname.replace(":", "");
+    }
+    hostname.toLowerCase();
+    mqttClient.setServer(mqttConfig.mqtt_server, mqttConfig.mqtt_port);
+    // Set callback if you want to handle incoming messages
+    // mqttClient.setCallback(mqttCallback);
+    printfBoth("Attempting to connect to MQTT broker as %s...", hostname.c_str());
+    if (mqttClient.connect(hostname.c_str(), mqttConfig.mqtt_user, mqttConfig.mqtt_password)) {
+        printBoth("MQTT Connected Successfully");
+        publishDiscoveryConfig(); // Use the clean discovery function only
+        // Subscribe to command topic for future remote control
+        mqttClient.subscribe(("homeassistant/" + hostname + "/command").c_str());
+    } else {
+        int state = mqttClient.state();
+        String errorMsg = "Initial MQTT connection failed, state: ";
+        switch (state) {
+            case -4: errorMsg += "MQTT_CONNECTION_TIMEOUT"; break;
+            case -3: errorMsg += "MQTT_CONNECTION_LOST"; break;
+            case -2: errorMsg += "MQTT_CONNECT_FAILED"; break;
+            case -1: errorMsg += "MQTT_DISCONNECTED"; break;
+            case 1: errorMsg += "MQTT_CONNECT_BAD_PROTOCOL"; break;
+            case 2: errorMsg += "MQTT_CONNECT_BAD_CLIENT_ID"; break;
+            case 3: errorMsg += "MQTT_CONNECT_UNAVAILABLE"; break;
+            case 4: errorMsg += "MQTT_CONNECT_BAD_CREDENTIALS"; break;
+            case 5: errorMsg += "MQTT_CONNECT_UNAUTHORIZED"; break;
+            default: errorMsg += String(state);
+        }
+        printBoth(errorMsg);
+        printBoth("Will retry in main loop");
+    }
 }
+
+void reconnectMQTT() {
+    loadMQTTConfig();
+    if (mqttConfig.isEmpty()) return;
+    String hostname = String(config.deviceName);
+    if (hostname.length() == 0) {
+        hostname = WiFi.macAddress();
+        hostname.replace(":", "");
+    }
+    hostname.toLowerCase();
+    if (mqttClient.connected()) return;
+    printfBoth("Attempting MQTT connection as %s...", hostname.c_str());
+    if (mqttClient.connect(hostname.c_str(), mqttConfig.mqtt_user, mqttConfig.mqtt_password)) {
+        printBoth("Connected to MQTT broker");
+        publishDiscoveryConfig(); // Use the clean discovery function only
+        // Subscribe to command topic
+        mqttClient.subscribe(("homeassistant/" + hostname + "/command").c_str());
+    } else {
+        int state = mqttClient.state();
+        String errorMsg = "Connection failed, state: ";
+        switch (state) {
+            case -4: errorMsg += "MQTT_CONNECTION_TIMEOUT"; break;
+            case -3: errorMsg += "MQTT_CONNECTION_LOST"; break;
+            case -2: errorMsg += "MQTT_CONNECT_FAILED"; break;
+            case -1: errorMsg += "MQTT_DISCONNECTED"; break;
+            case 1: errorMsg += "MQTT_CONNECT_BAD_PROTOCOL"; break;
+            case 2: errorMsg += "MQTT_CONNECT_BAD_CLIENT_ID"; break;
+            case 3: errorMsg += "MQTT_CONNECT_UNAVAILABLE"; break;
+            case 4: errorMsg += "MQTT_CONNECT_BAD_CREDENTIALS"; break;
+            case 5: errorMsg += "MQTT_CONNECT_UNAUTHORIZED"; break;
+            default: errorMsg += String(state);
+        }
+        printBoth(errorMsg);
+        printBoth("Will try again later");
+    }
+}
+
+void publishMQTTData(int gasValue) {
+    if (mqttConfig.isEmpty()) return;
+    String hostname = String(config.deviceName);
+    if (hostname.length() == 0) {
+        hostname = WiFi.macAddress();
+        hostname.replace(":", "");
+    }
+    hostname.toLowerCase();
+    if (!mqttClient.connected()) {
+        printBoth("MQTT disconnected, attempting to reconnect...");
+        if (mqttClient.connect(hostname.c_str(), mqttConfig.mqtt_user, mqttConfig.mqtt_password)) {
+            printBoth("connected");
+        } else {
+            printBoth("failed");
+            return;
+        }
+    }
+    mqttClient.loop();
+    String topic = "homeassistant/sensor/" + hostname + "/gas/state";
+    String gasValueStr = String(gasValue);
+    mqttClient.publish(topic.c_str(), gasValueStr.c_str(), true);
+}
+
+// Publishes Home Assistant discovery config for the gas sensor
+void publishDiscoveryConfig() {
+    String hostname = String(config.deviceName);
+    hostname.toLowerCase();
+    hostname.replace(".", "_");
+    for (size_t i = 0; i < hostname.length(); i++) {
+        if (!isalnum(hostname[i]) && hostname[i] != '_') hostname[i] = '_';
+    }
+    String configTopic = "homeassistant/sensor/" + hostname + "/gas/config";
+    String stateTopic = "homeassistant/sensor/" + hostname + "/gas/state";
+    // Do NOT use device_class: gas if using ppm as unit
+    String configPayload = "{";
+    configPayload += "\"name\":\"" + hostname + " Gas Sensor\",";
+    configPayload += "\"state_topic\":\"" + stateTopic + "\",";
+    configPayload += "\"unit_of_measurement\":\"ppm\",";
+    configPayload += "\"unique_id\":\"" + hostname + "_gas\"}";
+    bool pubSuccess = mqttClient.publish(configTopic.c_str(), configPayload.c_str(), true);
+    printfBoth("MQTT: Discovery config publish %s\n", pubSuccess ? "successful" : "failed");
+    printfBoth("Config topic: %s\n", configTopic.c_str());
+    printfBoth("Config payload: %s\n", configPayload.c_str());
 }
 
 void handleRoot() {
@@ -550,14 +665,14 @@ void handleRoot() {
   html += "><br>";
 
   html += "<div id='mqttSettings' class='mqtt-settings' style='display: " + String(config.mqttEnabled ? "block" : "none") + ";'>";
-  html += "<label for='mqttServer'>MQTT Server:</label>";
-  html += "<input type='text' id='mqttServer' name='mqttServer' value='" + String(config.mqttServer) + "'><br>";
-  html += "<label for='mqttUser'>MQTT User:</label>";
-  html += "<input type='text' id='mqttUser' name='mqttUser' value='" + String(config.mqttUser) + "'><br>";
-  html += "<label for='mqttPassword'>MQTT Password:</label>";
-  html += "<input type='password' id='mqttPassword' name='mqttPassword' value='" + String(config.mqttPassword) + "'><br>";
-  html += "<label for='mqttPort'>MQTT Port:</label>";
-  html += "<input type='number' id='mqttPort' name='mqttPort' value='" + String(config.mqttPort) + "'><br>";
+  html += "<label for='mqtt_server'>MQTT Server:</label>";
+  html += "<input type='text' id='mqtt_server' name='mqtt_server' value='" + String(config.mqttServer) + "'><br>";
+  html += "<label for='mqtt_user'>MQTT User:</label>";
+  html += "<input type='text' id='mqtt_user' name='mqtt_user' value='" + String(config.mqttUser) + "'><br>";
+  html += "<label for='mqtt_password'>MQTT Password:</label>";
+  html += "<input type='password' id='mqtt_password' name='mqtt_password' value='" + String(config.mqttPassword) + "'><br>";
+  html += "<label for='mqtt_port'>MQTT Port:</label>";
+  html += "<input type='number' id='mqtt_port' name='mqtt_port' value='" + String(config.mqttPort) + "'><br>";
   html += "</div>";
 
   html += "<label for='thresholdLimit'>Gas Threshold (ppm):</label>";
@@ -678,12 +793,37 @@ void handleSave() {
     config.ntfyEnabled = false;
   }
 
+  // Handle MQTT settings (use DeskClock-compatible field names and save to MQTTConfig)
+  if (server.hasArg("mqtt_server")) {
+    strncpy(mqttConfig.mqtt_server, server.arg("mqtt_server").c_str(), sizeof(mqttConfig.mqtt_server) - 1);
+  }
+  if (server.hasArg("mqtt_port")) {
+    mqttConfig.mqtt_port = server.arg("mqtt_port").toInt();
+  }
+  if (server.hasArg("mqtt_user")) {
+    strncpy(mqttConfig.mqtt_user, server.arg("mqtt_user").c_str(), sizeof(mqttConfig.mqtt_user) - 1);
+  }
+  if (server.hasArg("mqtt_password")) {
+    strncpy(mqttConfig.mqtt_password, server.arg("mqtt_password").c_str(), sizeof(mqttConfig.mqtt_password) - 1);
+  }
+  saveMQTTConfig();
+  loadMQTTConfig();
+  if (mqttConfig.isEmpty()) {
+    config.mqttEnabled = false;
+    printlnBoth("MQTT config not found or invalid, MQTT disabled");
+  }
+
   // Handle MQTT client disconnect if being disabled
   if (wasMqttEnabled && !config.mqttEnabled) {
     mqttClient.disconnect();
   }
   
   saveConfig();
+  loadMQTTConfig(); // Reload after saving
+  if (mqttConfig.isEmpty()) {
+    config.mqttEnabled = false;
+    printlnBoth("MQTT config not found or invalid, MQTT disabled");
+  }
   
   // If MQTT was enabled, initialize it
   if (!wasMqttEnabled && config.mqttEnabled) {
@@ -697,7 +837,7 @@ void handleSave() {
 void handleUpdate() {
   HTTPUpload& upload = server.upload();
   if (upload.status == UPLOAD_FILE_START) {
-    Serial.println("Update: " + String(upload.filename));
+    printlnBoth("Update: " + String(upload.filename));
     uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
     if (!Update.begin(maxSketchSpace)) {
       Update.printError(Serial);
@@ -708,7 +848,7 @@ void handleUpdate() {
     }
   } else if (upload.status == UPLOAD_FILE_END) {
     if (Update.end(true)) {
-      Serial.println("Update Success: " + String(upload.totalSize));
+      printlnBoth("Update Success: " + String(upload.totalSize));
       server.send(200, "text/plain", "Update successful! Rebooting...");
       delay(1000);
       ESP.restart();
@@ -781,10 +921,10 @@ void handleUpdatePage() {
 
 // Callback for when device enters config mode
 void configModeCallback(WiFiManager *myWiFiManager) {
-  Serial.println("Failed to connect to WiFi");
-  Serial.println("Entered config mode");
-  Serial.println("AP IP address: " + WiFi.softAPIP().toString());
-  Serial.println("AP SSID: " + myWiFiManager->getConfigPortalSSID());
+  printlnBoth("Failed to connect to WiFi");
+  printlnBoth("Entered config mode");
+  printlnBoth("AP IP address: " + WiFi.softAPIP().toString());
+  printlnBoth("AP SSID: " + myWiFiManager->getConfigPortalSSID());
 }
 
 void printGasDataBuffer() {
@@ -794,12 +934,12 @@ void printGasDataBuffer() {
             telnetClient.println("Gas Data Buffer:");
             telnetClient.printf("[%.2f]", gasDataBuffer[i]);
           }
-            Serial.printf("[%.2f]", gasDataBuffer[i]);
+            printfBoth("[%.2f]", gasDataBuffer[i]);
         }
         if (telnetClient && telnetClient.connected()) {
         telnetClient.printf("\n");
         }
-        Serial.printf("\n");
+        printfBoth("\n");
     }
 
 // Function to set RGB LED color
@@ -931,47 +1071,26 @@ void updateLedStatus() {
   }
 }
 
-void sendIpAddressNotification() {
-  if (WiFi.status() == WL_CONNECTED ) {
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-
-    String url = String("https://ntfy.sh/") + config.topicName;
-    String ipAddress = WiFi.localIP().toString();
-    String message = "Device IP Address: " + ipAddress;
-
-    Serial.printf("Sending IP address notification to ntfy topic: %s\n", url.c_str());
-    http.begin(client, url.c_str());
-    http.addHeader("Title", "Device IP Address");
-
-    int httpResponseCode = http.POST(message);
-    if (httpResponseCode > 0) {
-      Serial.printf("IP address notification sent successfully, HTTP code: %d\n", httpResponseCode);
-    } else {
-      Serial.printf("Failed to send IP address notification, HTTP error: %s\n", http.errorToString(httpResponseCode).c_str());
-    }
-    http.end();
-  } else {
-    Serial.println("WiFi not connected or ntfy notifications disabled, skipping IP address notification");
-  }
-}
-
 void setup() {
   Serial.begin(9600);
 
   // Initialize LittleFS
   if (!LittleFS.begin()) {
-    Serial.println("Failed to mount file system");
+    printlnBoth("Failed to mount file system");
     return;
   }
 
   // Load configuration from LittleFS
   loadConfig();
+  loadMQTTConfig(); // Only load once at startup
+  if (mqttConfig.isEmpty()) {
+    config.mqttEnabled = false;
+    printlnBoth("MQTT config not found or invalid, MQTT disabled");
+  }
 
   // Check if restart counter has reached 3 - if so, calibration reset
   if (config.restartCounter >= 3) {
-    Serial.println("Restart counter reached 3 - performing calibration reset");
+    printlnBoth("Restart counter reached 3 - performing calibration reset");
     
     
     // Reset counter to 0
@@ -983,7 +1102,7 @@ void setup() {
   
   }
   if (config.restartCounter >= 5) {
-    Serial.println("Restart counter reached 5 - performing factory reset");
+    printlnBoth("Restart counter reached 5 - performing factory reset");
     
     // Clear stored configurations
     LittleFS.remove("/config.json");
@@ -1010,7 +1129,7 @@ void setup() {
   
   // Increment restart counter and save
   config.restartCounter++;
-  Serial.printf("Restart counter: %d\n", config.restartCounter);
+  printfBoth("Restart counter: %d\n", config.restartCounter);
   saveConfig();
   
   
@@ -1048,21 +1167,21 @@ void setup() {
   String apName = "GasDetector-" + String(ESP.getChipId());
   
   // Try to connect to WiFi or start AP mode if needed
-  Serial.println("Attempting to connect to WiFi...");
+  printlnBoth("Attempting to connect to WiFi...");
   if (!wifiManager.autoConnect(apName.c_str())) {
-    Serial.println("Failed to connect to WiFi and AP mode timed out");
-    Serial.println("Continuing in offline mode, will retry WiFi connection later");
+    printlnBoth("Failed to connect to WiFi and AP mode timed out");
+    printlnBoth("Continuing in offline mode, will retry WiFi connection later");
     // Set flag to indicate we're in offline mode after AP timeout
     apModeTimedOut = true;
     lastWifiRetryTime = millis();
   } else {
-    Serial.println("Connected to WiFi");
+    printlnBoth("Connected to WiFi");
   }
 
   // Ensure we are in station mode for mDNS
   WiFi.mode(WIFI_STA);
   delay(100);
-  Serial.printf("WiFi mode: %d (1=STA,2=AP,3=STA+AP)\n", WiFi.getMode());
+  printfBoth("WiFi mode: %d (1=STA,2=AP,3=STA+AP)\n", WiFi.getMode());
 
   // Format and sanitize hostname
   String hostname = String(config.deviceName);
@@ -1076,20 +1195,20 @@ void setup() {
   // Set WiFi hostname and start mDNS responder
   WiFi.hostname(hostname.c_str());  // set DHCP hostname
   delay(100);
-  Serial.print("DHCP hostname: ");
-  Serial.println(WiFi.hostname());
+  printBoth("DHCP hostname: ");
+  printlnBoth(WiFi.hostname());
   
   if (!MDNS.begin(hostname.c_str())) {
-    Serial.println("Error setting up mDNS responder");
+    printlnBoth("Error setting up mDNS responder");
     // Debug info
-    Serial.print("Local IP: "); Serial.println(WiFi.localIP());
-    Serial.print("MAC: "); Serial.println(WiFi.macAddress());
+    printBoth("Local IP: "); printlnBoth(WiFi.localIP().toString());
+    printBoth("MAC: "); printlnBoth(WiFi.macAddress());
   } else {
     MDNS.addService("http", "tcp", 80);
     MDNS.addService("telnet", "tcp", 23);
-    Serial.printf("mDNS responder started: %s.local\n", hostname.c_str());
+    printfBoth("mDNS responder started: %s.local\n", hostname.c_str());
     // Debug info
-    Serial.print("mDNS hostname: "); Serial.println(hostname + ".local");
+    printBoth("mDNS hostname: "); printlnBoth(hostname + ".local");
   }
 
   // Configure OTA with same hostname
@@ -1103,33 +1222,33 @@ void setup() {
       type = "filesystem";
     }
     // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
-    Serial.println("Start updating " + type);
+    printlnBoth("Start updating " + type);
   });
   ArduinoOTA.onEnd([]() {
-    Serial.println("\nEnd");
+    printlnBoth("\nEnd");
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    printfBoth("Progress: %u%%\r", (progress / (total / 100)));
   });
   ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("Error[%u]: ", error);
+    printfBoth("Error[%u]: ", error);
     if (error == OTA_AUTH_ERROR) {
-      Serial.println("Auth Failed");
+      printlnBoth("Auth Failed");
     } else if (error == OTA_BEGIN_ERROR) {
-      Serial.println("Begin Failed");
+      printlnBoth("Begin Failed");
     } else if (error == OTA_CONNECT_ERROR) {
-      Serial.println("Connect Failed");
+      printlnBoth("Connect Failed");
     } else if (error == OTA_RECEIVE_ERROR) {
-      Serial.println("Receive Failed");
+      printlnBoth("Receive Failed");
     } else if (error == OTA_END_ERROR) {
-      Serial.println("End Failed");
+      printlnBoth("End Failed");
     }
   });
   ArduinoOTA.begin();
 
-  Serial.println("OTA Ready");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
+  printlnBoth("OTA Ready");
+  printBoth("IP address: ");
+  printlnBoth(WiFi.localIP().toString());
 
   // Send IP address notification after reboot
   //sendIpAddressNotification();
@@ -1137,7 +1256,7 @@ void setup() {
   // Start Telnet server
   telnetServer.begin();
   telnetServer.setNoDelay(true);
-  Serial.println("Telnet server started");
+  printlnBoth("Telnet server started");
 
   
 
@@ -1157,7 +1276,7 @@ void setup() {
     ESP.restart();
   }, handleUpdate);
   server.begin();
-  Serial.println("Web server started");
+  printlnBoth("Web server started");
 
   // Only setup MQTT if enabled in config
   
@@ -1168,7 +1287,7 @@ void setup() {
   }
   else
   {
-    Serial.println("WiFi not connected. Skipping MQTT setup.");
+    printlnBoth("WiFi not connected. Skipping MQTT setup.");
   }
 
   systemStartTime = millis(); // Record the system start time
@@ -1184,7 +1303,7 @@ void loop() {
   // Check AP mode timeout and WiFi connection
   if (!apModeTimedOut && WiFi.getMode() == WIFI_AP) {
     if (currentTime - apModeStartTime >= AP_MODE_TIMEOUT) {
-      Serial.println("AP mode timeout reached. Switching to offline mode.");
+      printlnBoth("AP mode timeout reached. Switching to offline mode.");
       WiFi.softAPdisconnect(true);
       WiFi.mode(WIFI_STA);
       apModeTimedOut = true;
@@ -1197,7 +1316,7 @@ void loop() {
   // If we're in offline mode (AP timed out), periodically try to reconnect to WiFi
   if (apModeTimedOut && WiFi.status() != WL_CONNECTED) {
     if (currentTime - lastWifiRetryTime >= WIFI_RETRY_INTERVAL) {
-      Serial.println("Trying to reconnect to WiFi...");
+      printlnBoth("Trying to reconnect to WiFi...");
       // Use WiFi.begin() without parameters to reconnect using stored credentials
       WiFi.begin();
       
@@ -1205,13 +1324,13 @@ void loop() {
       unsigned long connectStart = millis();
       while (WiFi.status() != WL_CONNECTED && millis() - connectStart < 10000) {
         delay(500);
-        Serial.print(".");
+        printBoth(".");
       }
       
       if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\nConnected to WiFi!");
+        printlnBoth("\nConnected to WiFi!");
       } else {
-        Serial.println("\nFailed to connect to WiFi, continuing in offline mode");
+        printlnBoth("\nFailed to connect to WiFi, continuing in offline mode");
       }
       
       lastWifiRetryTime = currentTime;
@@ -1223,7 +1342,7 @@ void loop() {
     if (!telnetClient || !telnetClient.connected()) {
       if (telnetClient) telnetClient.stop();
       telnetClient = telnetServer.accept();
-      Serial.println("New Telnet client connected");
+      printlnBoth("New Telnet client connected");
     } else {
       telnetServer.accept().stop(); // Reject new client if already connected
     }
@@ -1253,6 +1372,12 @@ void loop() {
     mqttClient.loop(); // Call loop frequently to maintain connection
   }
 
+  // Publish discovery config every 5 minutes
+  if (config.mqttEnabled && mqttClient.connected() && millis() - lastDiscoveryPublish > discoveryPublishInterval) {
+    publishDiscoveryConfig();
+    lastDiscoveryPublish = millis();
+  }
+
   unsigned long now = millis();
 
   // Check if we need to start calibration after warmup
@@ -1261,7 +1386,7 @@ void loop() {
     calibrationRunning = true;
     calibrationStartTime = currentTime;
     calibrationReadingCount = 0;
-    Serial.println("Starting calibration process for 5 minutes...");
+    printlnBoth("Starting calibration process for 5 minutes...");
     if (telnetClient && telnetClient.connected()) {
       telnetClient.println("Starting calibration process for 5 minutes...");
     }
@@ -1290,7 +1415,7 @@ void loop() {
         if (telnetClient && telnetClient.connected()) {
           telnetClient.printf("Calibration reading %d: %.2f\n", calibrationReadingCount, medianValue);
         }
-        Serial.printf("Calibration reading %d: %.2f\n", calibrationReadingCount, medianValue);
+        printfBoth("Calibration reading %d: %.2f\n", calibrationReadingCount, medianValue);
       }
       
       // Add gas sensor value to buffer
@@ -1305,7 +1430,7 @@ void loop() {
       for (int i = 0; i < BUFFER_SIZE; i++) {
         gasDataBuffer[i] = 0;
       }
-      Serial.printf("Calibration complete. Base gas value: %d\n", config.baseGasValue);
+      printfBoth("Calibration complete. Base gas value: %d\n", config.baseGasValue);
       if (telnetClient && telnetClient.connected()) {
         telnetClient.printf("Calibration complete. Base gas value: %d\n", config.baseGasValue);
       }
@@ -1333,7 +1458,7 @@ void loop() {
       //if (telnetClient && telnetClient.connected()) {
       //  telnetClient.printf("Gas Sensor Value: %.2f\n", gasReading);
       //}
-      Serial.printf("Gas Sensor Value: %.2f (raw: %.2f, base: %d)\n", gasReading, rawGasReading, config.baseGasValue);
+      printfBoth("Gas Sensor Value: %.2f (raw: %.2f, base: %d)\n", gasReading, rawGasReading, config.baseGasValue);
       if (telnetClient && telnetClient.connected()) {
         telnetClient.printf("Gas Sensor Value: %.2f (raw: %.2f, base: %d)\n", gasReading, rawGasReading, config.baseGasValue);
       }
@@ -1404,30 +1529,5 @@ void loop() {
   if (millis() - _mdnsTimer >= 1000) {
     MDNS.update();
     _mdnsTimer = millis();
-  }
-}
-
-void publishMQTTData(int gasValue) {
-  Serial.printf("Publishing gas value: %d\n", gasValue);
-  if (telnetClient && telnetClient.connected()) {
-    telnetClient.printf("Gas Sensor Value: %d\n", gasValue);
-  }
-
-  // Only publish if MQTT is enabled and connected
-  if (config.mqttEnabled ) {
-   
-   
-    mqttClient.loop();
-    // Publish gas sensor value to MQTT topic
-    String gasValueStr = String(gasValue);
-    String topic = "homeassistant/sensor/" + String(config.deviceName) + "/gas/state";
-    
-    // Publish without retain flag for real-time updates
-    bool pubSuccess = mqttClient.publish(topic.c_str(), gasValueStr.c_str(), false);
-    
-    // Log publish result to telnet if connected
-    if (telnetClient && telnetClient.connected()) {
-      telnetClient.printf("MQTT: State publish to %s %s: %s\n", topic.c_str(),gasValueStr.c_str(), pubSuccess ? "successful" : "failed");
-    }
   }
 }
