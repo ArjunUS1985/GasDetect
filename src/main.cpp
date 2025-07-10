@@ -17,6 +17,9 @@ void printBoth(const String& msg);
 // Forward declaration for publishDiscoveryConfig
 void publishDiscoveryConfig();
 
+// Forward declaration of publishMQTTData with correct data type
+void publishMQTTData(float gasValue);
+
 WiFiServer telnetServer(23);
 WiFiClient telnetClient;
 WiFiClient espClient;
@@ -193,9 +196,6 @@ bool apModeTimedOut = false;
 unsigned long lastDiscoveryPublish = 0;
 const unsigned long discoveryPublishInterval = 5 * 60 * 1000; // 5 minutes
 
-// Forward declaration of publishMQTTData
-void publishMQTTData(int gasValue);
-
 // Add function prototype at the top of the file, before it's used:
 void setLedColor(bool r, bool g, bool b);
 
@@ -225,35 +225,65 @@ void printfBoth(const char* fmt, ...) {
 }
 
 void sendNotification(bool isAlert) {
-    //if (!(WiFi.status() == WL_CONNECTED) || !config.ntfyEnabled) {
-    //    printlnBoth("WiFi not connected or ntfy notifications disabled, skipping notification");
-    //    return;
-    //}
-//
-    //if (secureClient == nullptr || httpClient == nullptr) {
-    //    setupNotifications();
-    //}
-//
-    //String url = String(F("https://ntfy.sh/")) + config.topicName;
-    //
-    //if (!httpClient->begin(*secureClient, url)) {
-    //    printlnBoth(F("Failed to begin HTTP client"));
-    //    return;
-    //}
-//
-    //httpClient->addHeader(F("Title"), F("Gas Detector Alert"));
-    //httpClient->addHeader(F("Content-Type"), F("text/plain"));
-    //
-    //const char* message = isAlert ? ALERT_MESSAGE : NORMAL_MESSAGE;
-    //int httpResponseCode = httpClient->POST(message);
-    //
-    //if (httpResponseCode > 0) {
-    //    printfBoth(PSTR("Notification sent successfully, HTTP code: %d\n"), httpResponseCode);
-    //} else {
-    //    printfBoth(PSTR("Notification Failed, HTTP error: %s\n"), httpClient->errorToString(httpResponseCode).c_str());
-    //}
-    //
-    //httpClient->end();
+    if (!(WiFi.status() == WL_CONNECTED) || !config.ntfyEnabled) {
+        printlnBoth("WiFi not connected or ntfy notifications disabled, skipping notification");
+        return;
+    }
+   
+   String url = String(F("https://ntfy.sh/")) + config.topicName;
+    
+    if (!httpClient->begin(*secureClient, url)) {
+        printlnBoth(F("Failed to begin HTTP client"));
+        return;
+    }
+    httpClient->addHeader(F("Title"), F("Gas Detector Alert"));
+    httpClient->addHeader(F("Content-Type"), F("text/plain"));
+    
+    const char* message = isAlert ? ALERT_MESSAGE : NORMAL_MESSAGE;
+    int httpResponseCode = httpClient->POST(message);
+    
+    if (httpResponseCode > 0) {
+        printfBoth(PSTR("Notification sent successfully, HTTP code: %d\n"), httpResponseCode);
+    } else {
+        printfBoth(PSTR("Notification Failed, HTTP error: %s\n"), httpClient->errorToString(httpResponseCode).c_str());
+    }
+    
+    httpClient->end();
+}
+
+void sendStartupNotification() {
+    if (!(WiFi.status() == WL_CONNECTED) || !config.ntfyEnabled) {
+        printlnBoth("WiFi not connected or ntfy notifications disabled, skipping startup notification");
+        return;
+    }
+    // Prepare message
+    String ip = WiFi.localIP().toString();
+    String hostname = String(config.deviceName);
+    hostname.replace(" ", "-");
+    hostname.toLowerCase();
+    String mdnsUrl = hostname + ".local";
+    float ppm = analogRead(gasSensorPin) - config.baseGasValue;
+    if (ppm < 0) ppm = 0; // Ensure no negative values
+    String msg = "Device started!\nIP: " + ip + "\nMDNS: http://" + mdnsUrl + "/\nCurrent PPM: " + String(ppm, 1);
+
+    // Send to ntfy
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    String url = String("https://ntfy.sh/") + config.topicName;
+    if (http.begin(client, url)) {
+        http.addHeader("Title", "Gas Detector Online");
+        http.addHeader("Content-Type", "text/plain");
+        int code = http.POST(msg);
+        if (code > 0) {
+            printfBoth("Startup notification sent, HTTP code: %d\n", code);
+        } else {
+            printfBoth("Startup notification failed, HTTP error: %s\n", http.errorToString(code).c_str());
+        }
+        http.end();
+    } else {
+        printlnBoth("Failed to begin HTTP client for startup notification");
+    }
 }
 
 void addGasReading(float gasReading) {
@@ -341,10 +371,11 @@ void loadConfig() {
   config.thresholdLimit = json["thresholdLimit"] | 200;
   config.thresholdDuration = json["thresholdDuration"] | 5;
 
-  // Always set topicName to MAC address without colons
+  // Always set topicName to GasDetect_Macaddress (no colons)
   String mac = WiFi.macAddress();
   mac.replace(":", ""); // Remove colons from MAC address
-  strlcpy(config.topicName, mac.c_str(), sizeof(config.topicName));
+  String ntfyChannel = "GasDetect_" + mac;
+  strlcpy(config.topicName, ntfyChannel.c_str(), sizeof(config.topicName));
 
   config.ntfyEnabled = json["ntfyEnabled"] | true;  // Default to enabled for backwards compatibility
   config.baseGasValue = json["baseGasValue"] | -1; // Default to -1 if not set
@@ -580,7 +611,7 @@ void reconnectMQTT() {
     }
 }
 
-void publishMQTTData(int gasValue) {
+void publishMQTTData(float gasValue) {
     if (mqttConfig.isEmpty()) return;
     String hostname = String(config.deviceName);
     if (hostname.length() == 0) {
@@ -599,8 +630,9 @@ void publishMQTTData(int gasValue) {
     }
     mqttClient.loop();
     String topic = "homeassistant/sensor/" + hostname + "/gas/state";
-    String gasValueStr = String(gasValue);
-    mqttClient.publish(topic.c_str(), gasValueStr.c_str(), true);
+    String gasValueStr = String(gasValue, 1); // Format to 1 decimal place
+    bool published = mqttClient.publish(topic.c_str(), gasValueStr.c_str(), true);
+    printfBoth("MQTT publish %s: topic=%s, value=%s\n", published ? "SUCCESS" : "FAILED", topic.c_str(), gasValueStr.c_str());
 }
 
 // Publishes Home Assistant discovery config for the gas sensor
@@ -626,77 +658,78 @@ void publishDiscoveryConfig() {
 }
 
 void handleRoot() {
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<style>";
-  html += "body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f4f4f9; color: #333; }";
-  html += "h1, h2 { text-align: center; color: #444; }";
-  html += "form, .info-section, .danger-zone { max-width: 90%; margin: 1em auto; padding: 1em; background: #fff; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }";
-  html += "input[type='text'], input[type='password'], input[type='number'] { width: 100%; padding: 0.7em; margin: 0.5em 0; border: 1px solid #ccc; border-radius: 3px; box-sizing: border-box; }";
-  html += "input[type='submit'], button { width: 100%; background: #007BFF; color: white; border: none; padding: 0.7em; border-radius: 3px; cursor: pointer; font-size: 1em; }";
-  html += "input[type='submit']:hover, button:hover { background: #0056b3; }";
-  html += ".danger-button { background: #dc3545; }";
-  html += ".danger-button:hover { background: #c82333; }";
-  html += ".info-section p, .danger-zone p { margin: 0.5em 0; }";
-  html += ".info-section strong, .danger-zone strong { display: inline-block; width: 50%; }";
-  html += ".mqtt-settings { display: none; }";
-  html += "</style>";
+  String html = F("<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'>");
+  html += F("<style>");
+  html += F("body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f4f4f9; color: #333; }"
+            "h1, h2 { text-align: center; color: #444; }"
+            "form, .info-section, .danger-zone { max-width: 90%; margin: 1em auto; padding: 1em; background: #fff; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }"
+            "input[type='text'], input[type='password'], input[type='number'] { width: 100%; padding: 0.7em; margin: 0.5em 0; border: 1px solid #ccc; border-radius: 3px; box-sizing: border-box; }"
+            "input[type='submit'], button { width: 100%; background: #007BFF; color: white; border: none; padding: 0.7em; border-radius: 3px; cursor: pointer; font-size: 1em; }"
+            "input[type='submit']:hover, button:hover { background: #0056b3; }"
+            ".danger-button { background: #dc3545; }"
+            ".danger-button:hover { background: #c82333; }"
+            ".info-section p, .danger-zone p { margin: 0.5em 0; }"
+            ".info-section strong, .danger-zone strong { display: inline-block; width: 50%; }"
+            ".mqtt-settings { display: none; }"
+  );
+  html += F("</style>");
 
-  html += "<script>";
-  html += "function toggleMqttSettings() {";
-  html += "  var mqttDiv = document.getElementById('mqttSettings');";
-  html += "  var enabled = document.getElementById('mqttEnabled').checked;";
-  html += "  mqttDiv.style.display = enabled ? 'block' : 'none';";
-  html += "}";
-  html += "function confirmReset() {";
-  html += "  return confirm('WARNING: This will erase all settings including WiFi credentials and reboot the device. Continue?');";
-  html += "}";
-  html += "</script></head><body>";
+  html += F("<script>");
+  html += F("function toggleMqttSettings() {"
+            "  var mqttDiv = document.getElementById('mqttSettings');"
+            "  var enabled = document.getElementById('mqttEnabled').checked;"
+            "  mqttDiv.style.display = enabled ? 'block' : 'none';"
+            "}"
+            "function confirmReset() {"
+            "  return confirm('WARNING: This will erase all settings including WiFi credentials and reboot the device. Continue?');"
+            "}"
+            "</script></head><body>");
 
-  html += "<h1>Device Configuration</h1>";
-  html += "<form action='/save' method='POST'>";
-  html += "<label for='deviceName'>Device Name:</label>";
-  html += "<input type='text' id='deviceName' name='deviceName' value='" + String(config.deviceName) + "'><br>";
+  html += F("<h1>Device Configuration</h1>");
+  html += F("<form action='/save' method='POST'>");
+  html += F("<label for='deviceName'>Device Name:</label>");
+  html += "<input type='text' id='deviceName' name='deviceName' value='" + String(config.deviceName) + F("'><br>");
 
-  html += "<label for='mqttEnabled'>Enable MQTT:</label>";
+  html += F("<label for='mqttEnabled'>Enable MQTT:</label>");
   html += "<input type='checkbox' id='mqttEnabled' name='mqttEnabled' value='1' onchange='toggleMqttSettings()'";
   if (config.mqttEnabled) {
-    html += " checked";
+    html += F(" checked");
   }
-  html += "><br>";
+  html += F("><br>");
 
-  html += "<div id='mqttSettings' class='mqtt-settings' style='display: " + String(config.mqttEnabled ? "block" : "none") + ";'>";
-  html += "<label for='mqtt_server'>MQTT Server:</label>";
-  html += "<input type='text' id='mqtt_server' name='mqtt_server' value='" + String(config.mqttServer) + "'><br>";
-  html += "<label for='mqtt_user'>MQTT User:</label>";
-  html += "<input type='text' id='mqtt_user' name='mqtt_user' value='" + String(config.mqttUser) + "'><br>";
-  html += "<label for='mqtt_password'>MQTT Password:</label>";
-  html += "<input type='password' id='mqtt_password' name='mqtt_password' value='" + String(config.mqttPassword) + "'><br>";
-  html += "<label for='mqtt_port'>MQTT Port:</label>";
-  html += "<input type='number' id='mqtt_port' name='mqtt_port' value='" + String(config.mqttPort) + "'><br>";
-  html += "</div>";
+  html += "<div id='mqttSettings' class='mqtt-settings' style='display: " + String(config.mqttEnabled ? F("block") : F("none")) + F(";'>");
+  html += F("<label for='mqtt_server'>MQTT Server:</label>");
+  html += "<input type='text' id='mqtt_server' name='mqtt_server' value='" + String(config.mqttServer) + F("'><br>");
+  html += F("<label for='mqtt_user'>MQTT User:</label>");
+  html += "<input type='text' id='mqtt_user' name='mqtt_user' value='" + String(config.mqttUser) + F("'><br>");
+  html += F("<label for='mqtt_password'>MQTT Password:</label>");
+  html += "<input type='password' id='mqtt_password' name='mqtt_password' value='" + String(config.mqttPassword) + F("'><br>");
+  html += F("<label for='mqtt_port'>MQTT Port:</label>");
+  html += "<input type='number' id='mqtt_port' name='mqtt_port' value='" + String(config.mqttPort) + F("'><br>");
+  html += F("</div>");
 
-  html += "<label for='thresholdLimit'>Gas Threshold (ppm):</label>";
-  html += "<input type='number' id='thresholdLimit' name='thresholdLimit' value='" + String(config.thresholdLimit) + "'><br>";
-  html += "<label for='thresholdDuration'>Duration (s):</label>";
-  html += "<input type='number' id='thresholdDuration' name='thresholdDuration' value='" + String(config.thresholdDuration) + "'><br>";
+  html += F("<label for='thresholdLimit'>Gas Threshold (ppm):</label>");
+  html += "<input type='number' id='thresholdLimit' name='thresholdLimit' value='" + String(config.thresholdLimit) + F("'><br>");
+  html += F("<label for='thresholdDuration'>Duration (s):</label>");
+  html += "<input type='number' id='thresholdDuration' name='thresholdDuration' value='" + String(config.thresholdDuration) + F("'><br>");
 
-  html += "<label for='ntfyEnabled'>Enable NTFY Notifications:</label>";
+  html += F("<label for='ntfyEnabled'>Enable NTFY Notifications:</label>");
   html += "<input type='checkbox' id='ntfyEnabled' name='ntfyEnabled' value='1'";
   if (config.ntfyEnabled) {
-    html += " checked";
+    html += F(" checked");
   }
-  html += "><br>";
+  html += F("><br>");
 
-  html += "<label for='topicName'>Notification Topic:</label>";
-  html += "<input type='text' id='topicName' name='topicName' value='" + String(config.topicName) + "' readonly><br>";
+  html += F("<label for='topicName'>Notification Topic:</label>");
+  html += "<input type='text' id='topicName' name='topicName' value='" + String(config.topicName) + F("' readonly><br>");
 
-  html += "<input type='submit' value='Save'>";
-  html += "</form>";
+  html += F("<input type='submit' value='Save'>");
+  html += F("</form>");
 
-  html += "<div class='info-section'>";
-  html += "<h2>Device Information</h2>";
-  html += "<p><strong>IP Address:</strong><span>" + WiFi.localIP().toString() + "</span></p>";
-  html += "<p><strong>MAC Address:</strong><span>" + WiFi.macAddress() + "</span></p>";
+  html += F("<div class='info-section'>");
+  html += F("<h2>Device Information</h2>");
+  html += F("<p><strong>IP Address:</strong><span>") + WiFi.localIP().toString() + F("</span></p>");
+  html += F("<p><strong>MAC Address:</strong><span>") + WiFi.macAddress() + F("</span></p>");
   
   // Add memory information
   uint32_t freeHeap = ESP.getFreeHeap();
@@ -704,51 +737,51 @@ void handleRoot() {
   uint32_t freeSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
   uint32_t flashChipSize = ESP.getFlashChipSize();
   
-  html += "<p><strong>Free RAM:</strong><span>" + String(freeHeap) + " bytes</span></p>";
-  html += "<p><strong>Largest Free Block:</strong><span>" + String(maxFreeBlock) + " bytes</span></p>";
-  html += "<p><strong>Free Sketch Space:</strong><span>" + String(freeSketchSpace) + " bytes (" + String((freeSketchSpace * 100) / flashChipSize) + "%)</span></p>";
-  html += "<p><strong>Flash Chip Size:</strong><span>" + String(flashChipSize) + " bytes</span></p>";
-  html += "</div>";
+  html += F("<p><strong>Free RAM:</strong><span>") + String(freeHeap) + F(" bytes</span></p>");
+  html += F("<p><strong>Largest Free Block:</strong><span>") + String(maxFreeBlock) + F(" bytes</span></p>");
+  html += F("<p><strong>Free Sketch Space:</strong><span>") + String(freeSketchSpace) + F(" bytes (") + String((freeSketchSpace * 100) / flashChipSize) + F("%)</span></p>");
+  html += F("<p><strong>Flash Chip Size:</strong><span>") + String(flashChipSize) + F(" bytes</span></p>");
+  html += F("</div>");
 
-  html += "<div class='info-section'>";
-  html += "<h2>Sensor Values</h2>";
-  html += "<p><strong>Raw Value:</strong><span>" + String(analogRead(gasSensorPin)) + "</span></p>";
-  html += "<p><strong>Adjustment Value:</strong><span>" + String(config.baseGasValue) + "</span></p>";
-  html += "<p><strong>Adjusted Value:</strong><span>" + String(analogRead(gasSensorPin) - config.baseGasValue) + "</span></p>";
-  html += "</div>";
+  html += F("<div class='info-section'>");
+  html += F("<h2>Sensor Values</h2>");
+  html += F("<p><strong>Raw Value:</strong><span>") + String(analogRead(gasSensorPin)) + F("</span></p>");
+  html += F("<p><strong>Adjustment Value:</strong><span>") + String(config.baseGasValue) + F("</span></p>");
+  html += F("<p><strong>Adjusted Value:</strong><span>") + String(analogRead(gasSensorPin) - config.baseGasValue) + F("</span></p>");
+  html += F("</div>");
 
-  html += "<div class='info-section'>";
-  html += "<h2>Firmware Update</h2>";
-  html += "<p>Download and install latest firmware from GitHub.</p>";
-  html += "<a href='/update'><button style='background-color: #28a745;'>Update Firmware</button></a>";
-  html += "</div>";
+  html += F("<div class='info-section'>");
+  html += F("<h2>Firmware Update</h2>");
+  html += F("<p>Download and install latest firmware from GitHub.</p>");
+  html += F("<a href='/update'><button style='background-color: #28a745;'>Update Firmware</button></a>");
+  html += F("</div>");
 
-  html += "<div class='danger-zone'>";
-  html += "<h2>Danger Zone</h2>";
-  html += "<p>Erase all configurations including WiFi settings.</p>";
-  html += "<a href='/reset' onclick='return confirmReset()'><button class='danger-button'>Reset Device</button></a>";
-  html += "</div>";
+  html += F("<div class='danger-zone'>");
+  html += F("<h2>Danger Zone</h2>");
+  html += F("<p>Erase all configurations including WiFi settings.</p>");
+  html += F("<a href='/reset' onclick='return confirmReset()'><button class='danger-button'>Reset Device</button></a>");
+  html += F("</div>");
 
-  html += "<div class='danger-zone'>";
-  html += "<h2>Calibration Reset</h2>";
-  html += "<p>Erase the base gas value and restart the device to trigger calibration.</p>";
-  html += "<a href='/reset-calibration'><button class='danger-button'>Reset Calibration</button></a>";
-  html += "</div>";
+  html += F("<div class='danger-zone'>");
+  html += F("<h2>Calibration Reset</h2>");
+  html += F("<p>Erase the base gas value and restart the device to trigger calibration.</p>");
+  html += F("<a href='/reset-calibration'><button class='danger-button'>Reset Calibration</button></a>");
+  html += F("</div>");
 
-  html += "<div class='danger-zone'>";
-  html += "<h2>Restart Device</h2>";
-  html += "<p>Restart the device without erasing configurations.</p>";
-  html += "<a href='/restart'><button class='danger-button'>Restart Device</button></a>";
-  html += "</div>";
+  html += F("<div class='danger-zone'>");
+  html += F("<h2>Restart Device</h2>");
+  html += F("<p>Restart the device without erasing configurations.</p>");
+  html += F("<a href='/restart'><button class='danger-button'>Restart Device</button></a>");
+  html += F("</div>");
 
-  html += "<div class='danger-zone'>";
-  html += "<h2>Reset WiFi Settings</h2>";
-  html += "<p>Resetting WiFi settings will erase the saved WiFi credentials and restart the device to display the captive portal.</p>";
-  html += "<a href='/reset-wifi'><button class='danger-button'>Reset WiFi Settings</button></a>";
-  html += "</div>";
+  html += F("<div class='danger-zone'>");
+  html += F("<h2>Reset WiFi Settings</h2>");
+  html += F("<p>Resetting WiFi settings will erase the saved WiFi credentials and restart the device to display the captive portal.</p>");
+  html += F("<a href='/reset-wifi'><button class='danger-button'>Reset WiFi Settings</button></a>");
+  html += F("</div>");
 
-  html += "</body></html>";
-  server.send(200, "text/html", html);
+  html += F("</body></html>");
+  server.send(200, F("text/html"), html);
 }
 
 void handleSave() {
@@ -1293,6 +1326,10 @@ void setup() {
   systemStartTime = millis(); // Record the system start time
   config.restartCounter = 0;
   saveConfig();
+
+  // At the end of setup, after WiFi/mDNS and config are loaded
+  delay(500); // Small delay to ensure network is ready
+  sendStartupNotification();
 }
 
 void loop() {
@@ -1503,18 +1540,22 @@ void loop() {
       // Publish median value every 1 second
       if (now - lastPublishTime >= publishInterval) {
           float medianValue = calculateMedian(gasDataBuffer, BUFFER_SIZE);
-          //telnet print median value
-         // if (telnetClient && telnetClient.connected()) {
-         //     telnetClient.printf("Median Gas Sensor Value: %.2f\n", medianValue);
-         // }
-          unsigned long currentTime = millis();
-
-          // Skip publishing data for the first 10 seconds after system start
-          if (currentTime - systemStartTime > 60000) {
-            publishMQTTData(medianValue); // Publish median value
-          lastPublishTime = now;
+          
+          // Debug: Always log when we're about to publish
+          printfBoth("Publishing MQTT data: %.2f (system uptime: %lu ms)\n", medianValue, currentTime - systemStartTime);
+          if (telnetClient && telnetClient.connected()) {
+            telnetClient.printf("Publishing MQTT data: %.2f (system uptime: %lu ms)\n", medianValue, currentTime - systemStartTime);
           }
           
+          unsigned long currentTime = millis();
+
+          // Reduce startup delay from 60 seconds to 10 seconds
+          if (currentTime - systemStartTime > 10000) {
+            publishMQTTData(medianValue); // Publish median value
+            lastPublishTime = now;
+          } else {
+            printfBoth("Skipping MQTT publish - system still warming up (%lu seconds remaining)\n", (10000 - (currentTime - systemStartTime)) / 1000);
+          }
       }
     }
 
