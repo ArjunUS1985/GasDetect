@@ -1514,7 +1514,7 @@ void loop() {
         // if breach persists long enough, send notification every 10s
         if (now - breachStart >= (unsigned long)config.thresholdDuration * 1000) {
           alertState = true;  // Enable alert state with beeping
-          if (lastNotificationTime == 0 || now - lastNotificationTime >= 30000) {
+          if (lastNotificationTime == 0 || now - lastNotificationTime >= 120000) {
             sendNotification(true);
             lastNotificationTime = now;
           }
